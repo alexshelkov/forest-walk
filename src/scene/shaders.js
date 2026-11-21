@@ -1,7 +1,7 @@
 import {
   AA,
   ATLAS,
-  LV,
+  MEDIUM,
   NEAR_D,
   RAYD,
   RAYN,
@@ -270,15 +270,20 @@ const WK = array<vec3f, 10>(vec3f(1., 2., 1.), vec3f(-2., 1., .9), vec3f(3., 1.,
 export const S_G = /*wgsl*/ `
 // (fl: the way to the lightning in the sky and how bright it is now; st: storm, thick fog, the flash's kind, its
 // seed; wy: how far the wind has blown things so far, how soaked the ground is, the walker's speed x and z;
-// lt, ls: where the trees' and the shrubs' cards thin and end, lf.xy: where a far tree's picture comes in, all
-// following the fog: W_LEAF thin and vsFar, scene.js lodNow; ex: the average metering's key, its least and most,
-// and which exposure (W_POST); ea: the frame's seconds, 1 to take the frame's measure at once (W_METER), the
-// highlights' key H)
-struct G { vp: mat4x4f, sm: mat4x4f, cam: vec4f, right: vec4f, up: vec4f, fwd: vec4f, sun: vec4f, res: vec4f, mis: vec4f, wx: vec4f, fl: vec4f, st: vec4f, wy: vec4f, lt: vec4f, ls: vec4f, lf: vec4f, ex: vec4f, ea: vec4f };
+// lt, ls: where the trees' and the shrubs' cards thin and end, lf.xy: where a far tree's picture comes in, lf.zw:
+// where the fog closes (hazeT), all following the fog: W_LEAF thin and vsFar, scene.js lodNow; ex: the highlights'
+// key H, 1 for the old exposure rule (W_POST), ex.z debug.isolate's part (1 the tree without its far picture, 2
+// the far picture alone); ea: the frame's seconds, 1 to take its measure at once (W_METER); dbg: debug.isolate's
+// place x, z and reach, 1 a white mask, 2 the tree shaded alone)
+struct G { vp: mat4x4f, sm: mat4x4f, cam: vec4f, right: vec4f, up: vec4f, fwd: vec4f, sun: vec4f, res: vec4f, mis: vec4f, wx: vec4f, fl: vec4f, st: vec4f, wy: vec4f, lt: vec4f, ls: vec4f, lf: vec4f, ex: vec4f, ea: vec4f, dbg: vec4f };
 const SUNC = vec3f(3.3, 1.9, .86);
 const TAU = 6.2831853;
-const LOW = ${LV > 1};
+const LOW = ${!MEDIUM};
 fn sat(x: f32) -> f32 { return clamp(x, 0., 1.); }
+// debug.isolate: is a tree's card or a solid rooted at p left out, being away from the one place shown?
+fn isoOut(p: vec3f) -> bool { return g.dbg.w > .5 && distance(p.xz, g.dbg.xy) > g.dbg.z; }
+// and is it left out as the part not shown (far: of the far picture)?
+fn isoSkip(far: bool) -> bool { return g.dbg.w > .5 && g.ex.z > .5 && (g.ex.z < 1.5) == far; }
 fn ss(a: f32, b: f32, x: f32) -> f32 { let t = clamp((x - a) / (b - a), 0., 1.); return t * t * (3. - 2. * t); }
 fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(.06711056, .00583715)))); }
 fn hs(x: f32) -> f32 { return fract(sin(x * 127.1) * 43758.5453); }
@@ -317,13 +322,15 @@ fn hazeC(rd: vec3f) -> vec3f {
   return mix(mix(vec3f(.78, .9, .92), vec3f(.8, .88, .98), sat(g.wx.z * 2.)), vec3f(1.18, 1., .76), pow(toSun, 3.) * (1. - sat(g.wx.z * 3.)) * (1. - .8 * g.st.y)) * lum * (.78 - .2 * g.st.y) * (1. - .3 * g.st.x);
 }
 // How much light comes through d metres of fog along a ray that climbs ry a metre (the fog thins upward). Squared
-// in the exponent: what is near stays clear, and it closes in fast around 1 / wx.w metres. oy is unused
+// in the exponent: what is near stays clear, and it closes in fast around 1 / wx.w metres. oy is unused. Then the
+// fog closes: by the ray's own length it takes what is left between lf.z and lf.w metres, so nothing is seen any
+// more where drawing stops (scene.js lodNow)
 fn hazeT(d: f32, ry: f32, oy: f32) -> f32 {
   let k = .03 * ry; let e = select((1. - exp(-k * d)) / k, d, abs(k) < 1e-4);
   // (a little steeper than a plain haze: near things stay clear, and the forest steps back in several tones
   // before it is gone)
   // (in thick fog the nearest trunks are soft already: less steep)
-  return exp(-pow(g.wx.w * e, mix(1.7, 1.3, g.st.y)));
+  return exp(-pow(g.wx.w * e, mix(1.7, 1.3, g.st.y))) * (1. - ss(g.lf.z, g.lf.w, d));
 }
 `;
 
@@ -404,6 +411,13 @@ fn puff(uv: vec2f) -> f32 {
 }
 // the glow of the open horizon on upright surfaces
 fn side(n: vec3f, open: f32) -> vec3f { return mix(vec3f(.95, .52, .22), vec3f(.30, .31, .33), g.sun.w) * open * (1. - abs(n.y)) * .16; }
+// The fog's colour as far as it goes in a direction: what a thing shows where the fog has closed over it, and the
+// sky at and below the horizon, so the two meet without a line. Thick fog is uneven and drifting, both alike
+fn fogC(rd: vec3f) -> vec3f {
+  if (g.st.y <= 0.) { return hazeC(rd); }
+  let fogU = textureSampleLevel(tD, sR, vec2f(atan2(rd.z, rd.x) / TAU * 2. + g.cam.w * .004, rd.y * .9 - g.cam.w * .002), 0.).a;
+  return hazeC(rd) * (1. + (fogU - .5) * .22 * g.st.y);
+}
 // (with a ground mist on top: what lies within two metres of the ground fades sooner, and sooner still by the
 // streams, where the mist gathers)
 fn fog(c: vec3f, wp: vec3f) -> vec3f {
@@ -417,7 +431,7 @@ fn fog(c: vec3f, wp: vec3f) -> vec3f {
   // The fog between the trunks is lit by what sky reaches it (the light volume, part way along the ray): dimmer
   // and greener in the stand, bright along a gap. What is nearly gone takes the plain colour, as the sky does
   let lf = mix(mix(.5, 1., vol(g.cam.xyz + v * min(.55, 26. / d)).g), 1., ss(.45, .9, 1. - T));
-  return c * T + hazeC(rd) * mix(vec3f(.88, 1., .9), vec3f(1.), lf) * lf * (1. - T);
+  return c * T + fogC(rd) * mix(vec3f(.88, 1., .9), vec3f(1.), lf) * lf * (1. - T);
 }
 fn qrot(q: vec4f, v: vec3f) -> vec3f { return v + 2. * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
 // The wind at a plant standing at p, h metres up it: a lean downwind that comes and goes as gusts roll over the
@@ -529,6 +543,7 @@ fn place(i: VI, grow: f32) -> VO {
   w.y += sin(g.cam.w * .3 + i.c.y * 40.) * i.c.w;
   o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.n = qrot(i.b, i.n.xyz); o.op = i.p * i.a.w + i.c.y * 37.; o.on = i.n.xyz;
   o.m = i.c; o.q = i.b; o.ao = i.n.w;
+  if (isoOut(i.a.xyz) || isoSkip(false)) { o.cp = vec4f(0., 0., 2., 1.); }
   return o;
 }
 @vertex fn vs(i: VI) -> VO { return place(i, 0.); }
@@ -848,6 +863,7 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   // and green least (clear water with a little brown in it), and a pool adds a faint green veil of its own
   let path = max(-over, 0.) * under * (1. / max(sqrt(1. - (1. - V.y * V.y) / 1.77), .3) + 1.15);
   c = c * exp(-vec3f(.55, .38, 1.0) * path) + vec3f(.30, .32, .18) * amb(vec3f(0., 1., 0.), v1.g) * (1. - exp(-.15 * path));
+  if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(-1., 0., 0., 1.); } // (debug.isolate's mask: W_POST)
   return fin(fog(c, i.wp));
 }
 `;
@@ -882,9 +898,9 @@ struct LI { @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f 
 // repeats along it (for 7: the atlas's layer), the tree's kind
 struct LO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) uv: vec2f,
   @location(3) @interpolate(flat) col: vec3f, @location(4) @interpolate(flat) pr: vec4f, @location(5) @interpolate(flat) sd: vec2f,
-  // at: the picture of the foliage atlas a quad shows (its place and size there; its layer is pr.z); fx.x: how
-  // far its outline is drawn in, y: seen from above (vsN), z and w: a sub-card's own picture's layer (-1 none, 3
-  // bare wood) and how far it has turned out of its card; ou: where its own picture is in the atlas
+  // at: the picture of the foliage atlas a quad shows (its place and size there; its layer is pr.z); fx.y: seen
+  // from above (vsN), z and w: a sub-card's own picture's layer (-1 none, 3 bare wood) and how far it has turned
+  // out of its card, or a far picture's opacity (vsFar); ou: where its own picture is in the atlas
   @location(6) @interpolate(flat) at: vec4f, @location(7) @interpolate(flat) fx: vec4f, @location(8) ou: vec2f };
 fn shape2(v: f32) -> f32 { return sin(3.14159 * sat(v)); }
 fn h4(x: f32) -> vec4f { return fract(sin(vec4f(x, x + 1.7, x + 3.1, x + 5.3) * vec4f(127.1, 269.5, 419.2, 371.9)) * 43758.5453); }
@@ -971,6 +987,7 @@ fn cell4(n: i32) -> vec4f { return vec4f(f32(n % 4) * .25, f32(n / 4) * .25, .25
 fn solidK(y: TY, hA: f32) -> f32 { return y.grow * step(.01, hA) * step(.5, g.res.x); }
 @vertex fn vs(@builtin(vertex_index) vi: u32, i: LI) -> LO {
   var o: LO;
+  if (isoOut(i.a.xyz) || isoSkip(false)) { o.cp = vec4f(0., 0., 2., 1.); return o; }
   let u = f32(vi & 1u) * 2. - 1.; let v = sin(f32(vi >> 1u) / (ROWS - 1.) * 1.5708);
   let ty = i32(i.c.x * 255. + .5); let s1 = i.c.y; let s2 = i.c.z;
   let t = g.cam.w; let hA = i.b.w;
@@ -1061,7 +1078,7 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
   let q = vec2f(f32(cn & 1u) * 2. - 1., f32(cn >> 1u));
   o.col = y.col; o.uv = q; o.sd = vec2f(s1, s2); o.pr = vec4f(0., 7., 0., y.kind);
   o.cp = vec4f(0., 0., 2., 1.); o.wp = i.a.xyz; o.n = vec3f(0., 1., 0.); o.fx = vec4f(0., 1., -1., 0.);
-  if (show <= 0. || (k >= 2u && (g.mis.w == 1. || ty == 6))) { return o; }
+  if (show <= 0. || (k >= 2u && (g.mis.w == 1. || ty == 6)) || isoOut(i.a.xyz) || isoSkip(false)) { return o; }
   // Which pictures (atlas.js): a conifer's branchlet and bough by its kind (0 fir, 5 hemlock, 1 cedar; of a fir's
   // and a hemlock's there are two, taken by the card's seed); a broadleaf's limb's end (2 maple, 3 birch, 4 oak; a
   // bush's are a vine maple's); a dead branch's (7) are bare
@@ -1153,16 +1170,16 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
   return o;
 }
 // A whole tree's crown far off in the fog (world.js farT): one upright quad along the tree's lean that turns to
-// face the walker, with the picture of a far tree (atlas.js; which one: c.w). It comes in as the tree's own cards
-// thin out and end, its outline drawn from its thickest parts outward (fx.x), so nothing appears at once
+// face the walker, with the picture of a far tree (atlas.js; which one: c.w). It is all there always, blended in
+// as its tree's cards thin out, from lf.x to lf.y metres (fx.w, fsFar)
 const FARKIND = array<f32, 8>(0., 0., 0., 1., 6., 2., 3., 4.);
 @vertex fn vsFar(@builtin(vertex_index) vi: u32, i: LI) -> LO {
   var o: LO;
   let q = vec2f(f32(vi & 1u) * 2. - 1., f32(vi >> 1u));
   let s1 = i.c.y; let s2 = i.c.z; let pic = floor(i.c.w * 8.);
-  let inK = ss(g.lf.x, g.lf.y, distance(i.a.xz, g.cam.xz));
+  let inK = sat((distance(i.a.xz, g.cam.xz) - g.lf.x) / (g.lf.y - g.lf.x));
   o.cp = vec4f(0., 0., 2., 1.); o.wp = i.a.xyz; o.n = vec3f(0., 1., 0.); o.uv = q;
-  if (inK <= 0.) { return o; }
+  if (inK <= 0. || isoOut(i.a.xyz) || isoSkip(true)) { return o; }
   let cy = cos(i.b.x); let sy = sin(i.b.x); let ct = cos(i.b.y); let st = sin(i.b.y);
   let axis = vec3f(st * cy, ct, st * sy);
   let side = normalize(cross(axis, g.cam.xyz - i.a.xyz)) * select(1., -1., s2 > .5); // (half of them mirrored)
@@ -1171,7 +1188,7 @@ const FARKIND = array<f32, 8>(0., 0., 0., 1., 6., 2., 3., 4.);
   p.x += sw.x; p.z += sw.y;
   let kd = FARKIND[i32(pic)];
   o.col = folC(i32(kd), s1, s2) * .85; o.sd = vec2f(s1, s2);
-  o.pr = vec4f(.3, 7., 2., kd); o.at = vec4f(pic * .125, .5, .125, .25); o.fx = vec4f((1. - inK) * .46, 1., -1., 0.);
+  o.pr = vec4f(.3, 7., 2., kd); o.at = vec4f(pic * .125, .5, .125, .25); o.fx = vec4f(0., 1., -1., inK);
   o.cp = g.vp * vec4f(p, 1.); o.wp = p;
   o.n = normalize(vec3f(g.cam.x - i.a.x, 0., g.cam.z - i.a.z)) * .6 + vec3f(0., .8, 0.);
   return o;
@@ -1196,7 +1213,10 @@ struct GO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) @
   let r = dot(i.uv, i.uv);
   return vec4f(min(i.col * exp(-r * 7.) * (1. - ss(.7, 1., r)), vec3f(10.)), 0.);
 }
-@fragment fn fs(i: LO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+// A card's colour (fs), or a far tree's picture blended in (fsFar: its whole outline a pixel soft, times fx.w)
+@fragment fn fs(i: LO, @builtin(front_facing) ff: bool) -> @location(0) vec4f { return leafC(i, ff, false); }
+@fragment fn fsFar(i: LO, @builtin(front_facing) ff: bool) -> @location(0) vec4f { return leafC(i, ff, true); }
+fn leafC(i: LO, ff: bool, blended: bool) -> vec4f {
   let dist = length(i.wp - g.cam.xyz);
   let n = normalize(i.n); // lit by the crown's normal (litN): the same whichever face is seen
   let V = normalize(g.cam.xyz - i.wp); let L = g.sun.xyz;
@@ -1224,10 +1244,11 @@ struct GO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) @
     tx = vec4f(mix(tx.rgb, own.rgb, i.fx.w), mix(min(tx.a, own.a), own.a, i.fx.w) * onCard);
     alod = mix(alod, olod, i.fx.w);
   }
+  let fwa = fwidth(tx.a);
   if (pat == 7) {
     // (far off, where its small levels are soft, the outline is drawn a little further out: a crown is clumps
     // with gaps, not a mist of specks)
-    cut = step(mix(.5, .43, sat(alod / 3.)) + i.fx.x, tx.a);
+    cut = step(mix(.5, .43, sat(alod / 3.)), tx.a);
     let kd = i32(i.pr.w + .5);
     if (kd >= 2 && kd <= 4) {
       // leaves: each of its own hue (on a maple yellow, orange, red and still green on one twig); seen from the
@@ -1254,7 +1275,15 @@ struct GO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) @
   c += E * trc * tl * pow(sat(dot(-V, L)), 5.) * .8;
   // wet leaves shine: where a blade mirrors the sky overhead, a pale glint
   c += skyC(vec3f(0., 1., 0.)) * (g.wx.x * .22 * pow(sat(reflect(-V, n).y), 5.) * vv.g * (.3 + lt.b));
+  // (debug.isolate's white mask: W_POST shows where it is)
+  let mask = g.dbg.w > .5 && g.dbg.w < 1.5;
+  if (blended) {
+    let a = i.fx.w * sat((tx.a - mix(.5, .43, sat(alod / 3.))) / max(fwa, 1e-4) + .5);
+    if (mask) { if (a <= 0.) { discard; } return vec4f(-1., 0., 0., 1.); }
+    return vec4f(fin(fog(c, i.wp)).rgb * a, a);
+  }
   if (cut < .5) { discard; }
+  if (mask) { return vec4f(-1., 0., 0., 1.); }
   return fin(fog(c, i.wp));
 }
 `;
@@ -1642,8 +1671,8 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f };
 // the ray it stops (the bank and its trees, crowns hanging over the water), y how far off that is, in metres
 fn mirror(p: vec3f, R: vec3f) -> vec2f {
   var clear = 1.; var far = 0.;
-  for (var k = 0; k < ${LV > 1 ? 4 : 6}; k++) {
-    let t = 2.2 * exp2(f32(k) * ${LV > 1 ? '1.25' : '.8'});
+  for (var k = 0; k < ${MEDIUM ? 6 : 4}; k++) {
+    let t = 2.2 * exp2(f32(k) * ${MEDIUM ? '.8' : '1.25'});
     let v = vol(p + R * t);
     let b = max(ss(.75, .3, v.g), ss(.52, .46, v.r)) * clear;
     far += b * t; clear -= b;
@@ -1715,6 +1744,8 @@ fn mirror(p: vec3f, R: vec3f) -> vec2f {
 }
 @fragment fn fsB(i: VO) -> @location(0) vec4f {
   let rd = normalize(i.wp - g.cam.xyz); let o = g.sun.w; let t = g.cam.w;
+  // (debug.isolate, shaded: behind its tree the fog's own colour, as if all else stood deep in it)
+  if (g.dbg.w > 1.5) { return fin(fogC(rd)); }
   let mu = max(dot(rd, g.sun.xyz), 0.);
   var c = skyC(rd) + sunE() * ss(.9994, .9998, mu) * 6.;
   // clouds: two layers of noise drifting on a flat ceiling, lit from below by the low sun, a grey lid in the rain
@@ -1762,11 +1793,9 @@ fn mirror(p: vec3f, R: vec3f) -> vec2f {
   let tn = textureSampleLevel(tD, sR, vec2f(az * 37., .23), 0.);
   let tops = .012 + .022 * tn.a + .02 * pow(1. - abs(fract(az * 310. + tn.b * 2.) - .5) * 2., 3.) * ss(.35, .7, tn.b);
   c = mix(c, mix(hazeC(rd), vec3f(.07, .09, .08), .22), ss(tops, tops - .004, rd.y));
-  // the fog lies over the sky too, thickest toward the horizon
-  // (thick fog hides all of it, and is itself uneven and drifting)
-  let fogU = textureSampleLevel(tD, sR, vec2f(az * 2. + t * .004, rd.y * .9 - t * .002), 0.).a;
+  // the fog lies over the sky too, thickest toward the horizon (thick fog hides all of it: fogC)
   // (in the rain it thins sooner with height: the cloud's dark base shows over a pale band at the horizon)
-  c = mix(c, hazeC(rd) * (1. + (fogU - .5) * .22 * g.st.y), mix(exp(-max(rd.y, 0.) * mix(1.6, 5., sat(g.wx.z * 2.))) * sat(g.wx.w * 60.), 1., g.st.y * .94));
+  c = mix(c, fogC(rd), mix(exp(-max(rd.y, 0.) * mix(1.6, 5., sat(g.wx.z * 2.))) * sat(g.wx.w * 60.), 1., g.st.y * .94));
   c *= 1. + ((ss(.3, .7, n1 * .65 + n2 * .35) - .5) * .3 + .22 * rd.y) * ss(.05, .4, rd.y) * misty;
   return fin(c);
 }
@@ -2105,10 +2134,10 @@ export const W_RBLUR =
 `;
 
 // ---------------------------------------------------------------- the eye's measure of the frame
-// What exposure answers to (W_POST): the luminance of the frame in view before exposure, sky, fog and light shafts
-// in it, bloom not, as its log-average and as its highlights (the power mean with exponent 4). fsGrid: 16 x 16
-// cells of 4 x 4 filtered taps of the scene and its shafts each; fsAdapt: over them all, eased into the values
-// adapted to so far (the target written the frame before)
+// What exposure answers to (W_POST): the highlights of the frame in view, the power mean of its luminance with
+// exponent 4, before exposure, sky, fog and light shafts in it, bloom not. fsGrid: 16 x 16 cells of 4 x 4 filtered
+// taps of the scene and its shafts each; fsAdapt: over them all, eased into the value adapted to so far (the
+// target written the frame before)
 export const W_METER =
   S_G +
   W_FS +
@@ -2120,24 +2149,24 @@ export const W_METER =
 @group(0) @binding(4) var tL: texture_2d<f32>;
 @group(0) @binding(5) var tA: texture_2d<f32>;
 @fragment fn fsGrid(@builtin(position) fc: vec4f) -> @location(0) vec4f {
-  var s = vec2f(0.);
+  var s = 0.;
   for (var j = 0; j < 4; j++) { for (var i = 0; i < 4; i++) {
     let uv = (floor(fc.xy) + (vec2f(f32(i), f32(j)) + .5) * .25) / 16.;
     let c = textureSampleLevel(tS, sC, uv, 0.).rgb + textureSampleLevel(tR, sC, uv, 0.).rgb;
-    let l = max(dot(c, vec3f(.2126, .7152, .0722)), 1e-4);
-    s += vec2f(log(l), l * l * l * l);
+    let l = dot(c, vec3f(.2126, .7152, .0722));
+    s += l * l * l * l;
   } }
-  return vec4f(s / 16., 0., 1.);
+  return vec4f(s / 16., 0., 0., 1.);
 }
 // (the eye opens in 1.6 s and closes in 0.6; it holds while a lightning flash lights the frame, so a flash never
 // makes it pump: fl.w over a fiftieth of a full one)
 @fragment fn fsAdapt() -> @location(0) vec4f {
-  var s = vec2f(0.);
-  for (var j = 0; j < 16; j++) { for (var i = 0; i < 16; i++) { s += textureLoad(tL, vec2i(i, j), 0).rg; } }
-  let now = vec2f(exp(s.x / 256.), pow(s.y / 256., .25)); let was = textureLoad(tA, vec2i(0), 0).rg;
-  if (g.ea.y > .5 || !(was.x > 0.)) { return vec4f(now, 0., 1.); }
-  if (g.fl.w > .02) { return vec4f(was, 0., 1.); }
-  return vec4f(was + (now - was) * (1. - exp(-g.ea.x / select(vec2f(1.6), vec2f(.6), now > was))), 0., 1.);
+  var s = 0.;
+  for (var j = 0; j < 16; j++) { for (var i = 0; i < 16; i++) { s += textureLoad(tL, vec2i(i, j), 0).r; } }
+  let now = pow(s / 256., .25); let was = textureLoad(tA, vec2i(0), 0).r;
+  if (g.ea.y > .5 || !(was > 0.)) { return vec4f(now, 0., 0., 1.); }
+  if (g.fl.w > .02) { return vec4f(was, 0., 0., 1.); }
+  return vec4f(was + (now - was) * (1. - exp(-g.ea.x / select(1.6, .6, now > was))), 0., 0., 1.);
 }
 `;
 
@@ -2152,11 +2181,13 @@ export const W_POST =
 @group(0) @binding(3) var tR: texture_2d<f32>;
 @group(0) @binding(4) var tB: texture_2d<f32>;
 @group(0) @binding(5) var tDp: texture_depth${AA > 1 ? '_multisampled' : ''}_2d;
-@group(0) @binding(6) var tA: texture_2d<f32>; // the luminance adapted to: average, highlights (W_METER)
+@group(0) @binding(6) var tA: texture_2d<f32>; // the highlights adapted to (W_METER)
 fn sat3(x: vec3f) -> vec3f { return clamp(x, vec3f(0.), vec3f(1.)); }
 fn tmap(x: vec3f) -> vec3f { return sat3((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14)); }
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let px = vec2i(fc.xy);
+  // (debug.isolate's mask: white where the one tree shown is, black elsewhere)
+  if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(vec3f(step(textureLoad(tS, px, 0).r, -.5)), 1.); }
   let uv = fc.xy * g.res.zw;
   let zf = g.fwd.w / max(textureLoad(tDp, px, 0), 1e-6);
   // depth-aware upsample of the shafts, drawn at 1/RAYD of the screen (scene.js resize)
@@ -2174,11 +2205,9 @@ fn tmap(x: vec3f) -> vec3f { return sat3((x * (2.51 * x + .03)) / (x * (2.43 * x
   let bl = textureSampleLevel(tB, sC, uv, 0.).rgb;
   c += bl * .12; // (the bloom chain holds only what is brighter than 1: fsDown0)
   // Exposure: the old rule's, by how much sky reaches the walker (mis.x), stopped down while the highlights in view
-  // would go over H, to at most 2.5 times less. ex.w 1: the old rule alone; 2: the average brought to a key
-  let ad = textureLoad(tA, vec2i(0), 0).rg;
-  var e = g.mis.x * clamp(g.ea.z / max(g.mis.x * ad.y, 1e-6), .4, 1.);
-  if (g.ex.w > 1.5) { e = clamp(g.ex.x / max(ad.x, 1e-6), g.ex.y, g.ex.z); } else if (g.ex.w > .5) { e = g.mis.x; }
-  c *= e;
+  // would go over H, to at most 2.5 times less (ex.y 1: the old rule alone)
+  let hl = textureLoad(tA, vec2i(0), 0).r;
+  c *= g.mis.x * select(clamp(g.ex.x / max(g.mis.x * hl, 1e-6), .4, 1.), 1., g.ex.y > .5);
   let q = uv - .5;
   c *= 1. - dot(q, q) * .45;
   c = tmap(c);

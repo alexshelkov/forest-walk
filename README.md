@@ -1,4 +1,4 @@
-# Forest
+# Forest walk
 
 A [tik](https://codetik.dev): a small interactive app that runs inside a phone,
 offline, in the Codetik feed.

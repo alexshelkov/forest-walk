@@ -3,7 +3,8 @@
 // hundreds of MB, which would stall the tik the user is looking at.
 import { attachControls } from './controls';
 import type { Keys } from './keys';
-import { boot, type Scene, type SceneInput } from './scene/scene.js';
+import { chooseLevel, DEV } from './scene/quality.js';
+import type { Scene, SceneInput } from './scene/scene.js';
 
 const canvas = document.getElementById('scene') as HTMLCanvasElement;
 const bar = document.getElementById('bar')!;
@@ -21,12 +22,10 @@ const input: SceneInput = {
   turn: 0,
   fast: false,
 };
-// A dev machine: the tik served by `codetik dev` on this computer. Only there the scene is on `forest` in the
-// console, with a debug menu and keyboard walking. A published build has DEV false, so none of it ships (the
-// iOS app serves tiks from 127.0.0.1 too: the hostname alone would not tell).
-const ON_DEV_MACHINE =
-  import.meta.env.DEV &&
-  /^(localhost|127\.0\.0\.1|.+\.localhost)$/.test(location.hostname);
+// A dev machine (quality.js DEV): the tik served by `codetik dev` on this computer. Only there the scene is on
+// `forest` in the console, with a debug menu and keyboard walking. A published build has DEV false, so none of
+// it ships (the iOS app serves tiks from 127.0.0.1 too: the hostname alone would not tell).
+const ON_DEV_MACHINE = DEV;
 // What is known about this run, printed under a problem; the scene adds its own lines (scene.js).
 const facts: Record<string, string> = {
   stage: 'starting',
@@ -117,6 +116,9 @@ function say(message: string, to: number, ms: number): Promise<void> {
 async function start(): Promise<void> {
   booted = true;
   try {
+    // the level first (it asks the GPU adapter): every module of the scene is built for it
+    await chooseLevel();
+    const { boot } = await import('./scene/scene.js');
     scene = await boot({
       canvas,
       input,

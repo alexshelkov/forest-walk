@@ -1,4 +1,5 @@
-// Types for scene.js, the WebGPU renderer kept in the plain JavaScript of the project it grew from.
+// Types for scene.js, the WebGPU renderer kept in the plain JavaScript of the project it grew from. Its modules are
+// built for the level (Low or Medium) quality.js sets as they load: import it only after chooseLevel (main.ts).
 
 /**
  * What the frame loop reads. Touch: walk while held, look deltas in CSS pixels (consumed each frame). A keyboard
@@ -17,7 +18,7 @@ export interface SceneInput {
 export interface SceneEnv {
   canvas: HTMLCanvasElement;
   input: SceneInput;
-  /** Lines for the problem screen. The scene adds what it learns: detail level, GPU, canvas size. */
+  /** Lines for the problem screen. The scene adds what it learns: the level and why, GPU, canvas size. */
   facts: Record<string, string>;
   /** One loading stage: show the message, glide the bar to `to` (0-1) over about `ms`. A rejection ends the build. */
   say(message: string, to: number, ms: number): Promise<void>;
@@ -32,7 +33,7 @@ export interface Scene {
   resume(): void;
   /** Call on a user gesture: starts the sound once the loop runs. */
   wake(): void;
-  /** One line of numbers since the last call: frame rate, worst frame, render size, draw distance. */
+  /** One line of numbers since the last call: frame rate, worst frame, render size, draw distance, level. */
   stats(): string;
   /** For looking around from a debugger: jump to a viewpoint (0-5) or to any place and target, hold a state of the weather. */
   debug: {
@@ -70,7 +71,8 @@ export interface Scene {
     /**
      * Every crossing of running water, on the loop and the side paths: its make (0 planks on posts, 1 planks, 2
      * logs side by side, 3 a split log with a rail, 4 stepping stones), the water's half width, and where the
-     * way across begins and ends (x, z each).
+     * way across begins and ends (x, z each); for 2 to 4 also the line walked along (x, z each) and how far the
+     * timber reaches to each side of it (0 for stones).
      */
     crossings(): number[][];
     /** The dock: where the walk onto it begins, on the boardwalk, and where its planks end (x, z each). */
@@ -161,26 +163,45 @@ export interface Scene {
     ): void;
     /**
      * The exposure: 0 the old rule (by how much sky reaches the walker) stopped down for bright highlights in view,
-     * 1 the old rule alone, 2 the frame's average brought to a key. Returns the mode now.
+     * 1 the old rule alone. Returns the mode now.
      */
-    exposure(mode?: 0 | 1 | 2): number;
+    exposure(mode?: 0 | 1): number;
     /**
-     * What the eye has adapted to and what it makes of it: the frame's log-average luminance and its highlights (the
-     * power mean with exponent 4), both before exposure and eased; the exposure in use; the old rule's; the
-     * highlights' key H.
+     * What the eye has adapted to and what it makes of it: the frame's highlights (the power mean of its luminance
+     * with exponent 4, before exposure, eased); the exposure in use; the old rule's; the highlights' key H.
      */
     exposureNow(): Promise<number[]>;
+    /**
+     * Shows one tree alone on black (its cards, trunk and far picture: all rooted within `reach`, 3 m by default,
+     * of x, z): white, or `shaded` as it is (fogged, no light shafts, the opening view's exposure); `part` near:
+     * without its far picture, far: the far picture alone. Without arguments everything again. Returns the nearest
+     * far picture: its kind (atlas.js farTree: 0-1 fir, 2 hemlock, 3 cedar, 4 pole, 5-7 broadleaves), the foot of
+     * its crown (x, y, z) and its height.
+     */
+    isolate(
+      x?: number,
+      z?: number,
+      reach?: number,
+      shaded?: boolean,
+      part?: 'near' | 'far',
+    ): number[] | null;
     /**
      * The sub-cards that turn out of a card near the walker (W_LEAF vsN): 0 as normal, 1 none drawn, 2 drawn but
      * held flat on their cards, as at the edge of the near range. Returns the mode now.
      */
     sprigs(mode?: 0 | 1 | 2): number;
+    /**
+     * Holds the render size at about n pixels (the frame-time tuner left off), or lets the tuner go again (0).
+     * Returns the size now.
+     */
+    pixels(n: number): number;
     /** The last frame's triangles for each leaf tier, in thousands. */
     tiers(): number[];
     /**
      * The leaves' distances in the fog of the moment, in metres: a tree's cards whole to tree[0], thinned by rank
      * to tree[1], ending between tree[2] and tree[3]; a shrub's the same, ending by shrub[2]; a far tree's picture
-     * coming in from far[0] to far[1]. whole: for the trees and the shrubs, what the fog lets through at the
+     * blended in from far[0] to far[1] (as the trees' cards are thinned) and drawn to farEnd, farN of them in the
+     * last frame; a tree's cards are drawn to treeEnd. whole: for the trees and the shrubs, what the fog lets through at the
      * nearest distance where any card is not whole (W_LEAF thin, mirrored over every rank). cuts: where the leaf
      * tiers change sets.
      */
@@ -188,6 +209,16 @@ export interface Scene {
       tree: number[];
       shrub: number[];
       far: number[];
+      /** Where the fog closes: from, to (metres; far off when it does not). */
+      close: number[];
+      /**
+       * What the closed fog lets through where a tree's cards start and stop thinning, where they and where the far
+       * pictures stop being drawn.
+       */
+      closed: number[];
+      treeEnd: number;
+      farEnd: number;
+      farN: number;
       whole: number[];
       cuts: Record<string, number>;
     };

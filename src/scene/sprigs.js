@@ -80,17 +80,18 @@ const limbEnd = (ca, cb, sd) => {
   }
   return { sticks, subs };
 };
-// mid: the y where its card's two flat halves meet (a limb end's card is one flat quad: none)
+// mid: the y where its card's two flat halves meet (a limb end's card is one flat quad: none). A conifer's are
+// full: a bough of 14 or 15 branchlets (16 sub-cards at most), as wide as long; a branchlet of 12 to 15 sprays
 export const PICS = [
-  { ...feather(STEM_B, 12, 0.52, 0.8, 0, 1, 3), mid: 1 },
-  { ...feather(STEM_B, 12, 0.52, 0.8, 0, 1, 4), mid: 1 },
-  { ...feather(STEM_B, 13, 0.5, 0.8, 2, 3, 7), mid: 1 },
-  { ...feather(STEM_B, 11, 0.52, 0.8, 4, 4, 9), mid: 1 },
-  { ...feather(STEM_T, 11, 0.35, 0.62, 0, 0, 1), mid: 0.5 },
-  { ...feather(STEM_T, 11, 0.35, 0.62, 0, 0, 2), mid: 0.5 },
-  { ...feather(STEM_T, 13, 0.33, 0.62, 1, 1, 3), mid: 0.5 },
-  { ...feather(STEM_T, 13, 0.33, 0.62, 1, 1, 4), mid: 0.5 },
-  { ...feather(STEM_T, 10, 0.36, 0.62, 2, 2, 5), mid: 0.5 },
+  { ...feather(STEM_B, 15, 0.6, 1, 0, 1, 3), mid: 1 },
+  { ...feather(STEM_B, 15, 0.6, 1, 0, 1, 4), mid: 1 },
+  { ...feather(STEM_B, 15, 0.58, 1, 2, 3, 7), mid: 1 },
+  { ...feather(STEM_B, 14, 0.6, 1, 4, 4, 9), mid: 1 },
+  { ...feather(STEM_T, 13, 0.4, 0.75, 0, 0, 1), mid: 0.5 },
+  { ...feather(STEM_T, 13, 0.4, 0.75, 0, 0, 2), mid: 0.5 },
+  { ...feather(STEM_T, 15, 0.38, 0.75, 1, 1, 3), mid: 0.5 },
+  { ...feather(STEM_T, 15, 0.38, 0.75, 1, 1, 4), mid: 0.5 },
+  { ...feather(STEM_T, 12, 0.41, 0.75, 2, 2, 5), mid: 0.5 },
   { ...feather(STEM_T, 5, 0.34, 0.7, 3, 3, 6), mid: 0.5 },
   { ...limbEnd(4, 5, 6), mid: 0 },
   { ...limbEnd(4, 5, 7), mid: 0 },

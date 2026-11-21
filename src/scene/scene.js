@@ -28,15 +28,18 @@ import {
   AA,
   ATLAS,
   ATLAS_MIPS,
+  demote,
   keep,
-  LV,
+  MEDIUM,
   mob,
   NEAR_D,
   RAYD,
   SHADOW,
+  SIZE,
+  SLOW,
   SPRIGS,
-  SV,
   WATER,
+  WHY,
 } from './quality.js';
 import {
   abs,
@@ -156,10 +159,12 @@ const FOG = 0.031,
   FOG_END = 72;
 // No leaf may appear, vanish or change size while the fog still shows it. By V, what the fog lets through (hazeT):
 // a tree's cards stay whole down to the first, thin by rank to the second, then end between the last two; a
-// shrub's the same, ending from where its thinning ends to the last; a far tree's picture comes in over FAR_FADE
-const TREE_FADE = [0.22, 0.07, 0.05, 0.03],
-  SHRUB_FADE = [0.35, 0.12, 0.12, 0.06],
-  FAR_FADE = [0.1, 0.04];
+// shrub's the same, ending from where its thinning ends to the last. The fog closes over V's CLOSE (by the
+// unclosed curve: hazeT) and everything ends there. The thinning, and a far tree's picture blended in over the
+// trees' (W_LEAF vsFar), keep the clear day's distances in every weather (lodNow)
+const CLOSE = [0.06, 0.02],
+  TREE_FADE = [0.22, 0.07],
+  SHRUB_FADE = [0.35, 0.12, 0.12, 0.06];
 // MIST: how much of an overcast the fog makes of the day (0 a clear low sun, 1 rain cloud): the sun comes through it
 // pale and soft, the light is mostly the fog's own
 const MIST = 0.38;
@@ -172,11 +177,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   let raf = 0,
     dead = false,
     frames = 0;
-  // Every problem ends the scene and goes on screen. `retry` ones (out of memory, a GPU timeout) reload a level
-  // lower first, until Low.
+  // Every problem ends the scene and goes on screen. `retry` ones (out of memory, a GPU timeout) on Medium reload
+  // at Low first, and this device keeps to Low (quality.js)
   const stop = (m, retry, error) => {
-    if (retry && LV < 2) {
-      keep('forest', LV + 1);
+    if (retry && MEDIUM) {
+      demote('gpu');
       location.reload();
       return;
     }
@@ -188,7 +193,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const fail = (m) => {
     throw new Error(m, { cause: 1 });
   }; // cause marks a message that is shown as it is
-  facts.detail = ['High', 'Medium', 'Low'][LV];
+  const LEVEL = MEDIUM ? 'Medium' : 'Low';
+  facts.detail = `${LEVEL} (${WHY})`;
   if (!navigator.gpu)
     fail(
       'Forest needs WebGPU graphics: iOS 26 or later, or a recent Android phone.',
@@ -293,7 +299,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     magFilter: 'linear',
     minFilter: 'linear',
     mipmapFilter: 'linear',
-    maxAnisotropy: LV > 1 ? 4 : 8,
+    maxAnisotropy: MEDIUM ? 8 : 4,
   });
   const sClamp = device.createSampler({
     magFilter: 'linear',
@@ -347,14 +353,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     mipLevelCount: ATLAS_MIPS,
   });
 
-  // the scene's uniforms (struct G in shaders.js): two matrices and sixteen vec4, for the view and for the shadow pass
-  const UB = new Float32Array(96),
-    UBS = new Float32Array(96);
+  // the scene's uniforms (struct G in shaders.js): two matrices and seventeen vec4, for the view and for the shadow
+  // pass
+  const UB = new Float32Array(100),
+    UBS = new Float32Array(100);
   const ubo = device.createBuffer({
-      size: 384,
+      size: 400,
       usage: BU.UNIFORM | BU.COPY_DST,
     }),
-    uboS = device.createBuffer({ size: 384, usage: BU.UNIFORM | BU.COPY_DST });
+    uboS = device.createBuffer({ size: 400, usage: BU.UNIFORM | BU.COPY_DST });
   const WT = new Float32Array(4),
     uboW = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST });
 
@@ -559,7 +566,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // Leaf pipelines. Each store thins with distance (W_LEAF thin: the share kept goes from K0 to KMIN): the trees'
   // and the shrubs' cards by distances that follow the fog (STORE 1 and 2, lodNow), the ground's plants by their
   // own (PD1, PD2) and ending at PLANT_END
-  const PLANT_END = LV > 1 ? 38 : 46;
+  const PLANT_END = MEDIUM ? 46 : 38;
   const THIN_TREE = { STORE: 1, K0: 1.25, KMIN: 0.25 },
     THIN_SHRUB = { STORE: 2, K0: 1.25, KMIN: 0.25 },
     THIN_SMALL = { FAR: PLANT_END, PD1: 6, PD2: 28, K0: 1, KMIN: 0.15 };
@@ -579,9 +586,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       constants: THIN_SHRUB,
     });
   // a far tree's crown as one picture (W_LEAF vsFar)
-  const pLeafF = scenePipe(mLeaf, 'vsFar', 'fs', [ibLeaf], {
-    strip: true,
-  });
   const pFish = scenePipe(mAnim, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
   const pManta = scenePipe(mAnim, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
   // (the boat's lid: a solid drawn into the depth only, so the lake's surface stays out of the hull)
@@ -606,6 +610,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
     alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
   };
+  // a far tree's picture blended in (W_LEAF vsFar, fsFar) over the opaque scene, writing no depth (farSorted)
+  const pLeafFB = scenePipe(mLeaf, 'vsFar', 'fsFar', [ibLeaf], {
+    strip: true,
+    blend: ALPHA,
+  });
   const ADD = {
     color: { srcFactor: 'one', dstFactor: 'one' },
     alpha: { srcFactor: 'one', dstFactor: 'one' },
@@ -732,11 +741,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     vertex: { module: mPost, entryPoint: 'vs' },
     fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] },
   });
-  // The eye's measure of the frame (W_METER): a 16 x 16 grid of luminance (its log, its 4th power), and the
-  // luminance adapted to (average, highlights), in two targets that take turns, one written each frame from the
-  // other (meterAt: the one written last)
+  // The eye's measure of the frame (W_METER): a 16 x 16 grid of luminance to the 4th power, and the highlights
+  // adapted to, in two targets that take turns, one written each frame from the other (meterAt: the one written
+  // last)
   const mMeter = mod(W_METER, 'METER'),
-    METER = 'rg32float',
+    METER = 'r32float',
     meterPipe = (entry) =>
       rpipe({
         layout: 'auto',
@@ -770,7 +779,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   let meterAt = 0,
     meterNew = true, // take the next frame's measure at once: the first frame, and after a jump (lookAt)
     frameDt = 0,
-    expoMode = 0; // debug.exposure: 0 the old rule stopped down for highlights, 1 the old rule, 2 the average
+    expoMode = 0; // debug.exposure: 0 the old rule stopped down for highlights, 1 the old rule
 
   // ---------------------------------------------------------------- sun + shadow matrix
   // A low sun, about 21 degrees up and nearly ahead of the walk's first steps: long shadows, light between the trunks
@@ -825,9 +834,17 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
 
   // ---------------------------------------------------------------- world generation
   await say('Raising the hills…', 0.25, 1200);
-  // marks a load in progress (quality.js); leaving the page before it ends is not a crash
-  keep('forestLoad', 1);
+  // Marks a load in progress at this level (quality.js) while the page is in view: leaving it, or hiding it (a
+  // phone may kill an app sent to the background), before the load ends is not a crash
+  let loading = true;
+  const markLoad = () =>
+    keep(
+      'forestLoad',
+      loading && document.visibilityState === 'visible' ? LEVEL : '',
+    );
+  markLoad();
   addEventListener('pagehide', () => keep('forestLoad', ''));
+  document.addEventListener('visibilitychange', markLoad);
   // The density field (84 MB) lives only inside this call: when it returns, the generator's working memory goes
   const { water, T, Wd } = await (async () => {
     let D, water;
@@ -1038,35 +1055,134 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
 
   // ground(x, z): the height the walker and the animals stand on, the decks of the bridges and the dock included
   const ground = heightAt(Wd.hm);
-  // What the walker goes round (trunks, boulders, logs, rails: x, z, radius each), in a grid of 6 m cells
+  // What the walker goes round, in a grid of 6 m cells: obst, discs (trunks, boulders, logs, posts: x, z, radius
+  // each), and walled, the lines it slides along (rails, fences, the unseen edges of crossings and the dock: x0, z0,
+  // x1, z1, radius each, in every cell they cross)
   const OBW = 6,
     OBN = Math.ceil((NX * VS) / OBW),
-    obst = Array.from({ length: OBN * OBN }, () => []);
+    obst = Array.from({ length: OBN * OBN }, () => []),
+    walled = Array.from({ length: OBN * OBN }, () => []);
+  const cellOf = (v, o) => clamp(floor((v - o) / OBW), 0, OBN - 1);
   for (let i = 0; i < Wd.blocks.length; i += 3)
-    obst[
-      clamp(floor((Wd.blocks[i] - OX) / OBW), 0, OBN - 1) +
-        OBN * clamp(floor((Wd.blocks[i + 1] - OZ) / OBW), 0, OBN - 1)
-    ].push(Wd.blocks[i], Wd.blocks[i + 1], Wd.blocks[i + 2]);
-  // P2 = the point (x, z) moved out of every block around it, to `pad` beyond its radius
+    obst[cellOf(Wd.blocks[i], OX) + OBN * cellOf(Wd.blocks[i + 1], OZ)].push(
+      Wd.blocks[i],
+      Wd.blocks[i + 1],
+      Wd.blocks[i + 2],
+    );
+  // The narrow crossings (world.js: a split log, poles side by side, stepping stones) are walked as lanes: x, z,
+  // the way along, length, and room, how far the walker may stray from the middle line: what the crossing's
+  // unseen stops (0.22 m beside it) leave a walker kept 0.3 m from them (shove), and 5 cm at least, where they
+  // leave less. Walk keeps to it, led in by a funnel at each end. The stops leave the walls: two of them too
+  // near pushed the walker from one to the other and back
+  const LANE_MIN = 0.05,
+    lanes = [],
+    W8 = Wd.walls,
+    inLane = new Uint8Array(W8.length / 5);
+  for (const c of Wd.crossings) {
+    if (c.length < 11) continue;
+    const [x0, z0, x1, z1] = c.slice(6),
+      len = hypot(x1 - x0, z1 - z0),
+      ux = (x1 - x0) / len,
+      uz = (z1 - z0) / len;
+    let near = 1e9;
+    for (let k = 0; k < W8.length; k += 5) {
+      if (abs(W8[k + 4] - 0.22) > 1e-4) continue;
+      let far = 0,
+        offMin = 1e9;
+      for (const e of [0, 2]) {
+        const along = (W8[k + e] - x0) * ux + (W8[k + e + 1] - z0) * uz,
+          off = abs((W8[k + e + 1] - z0) * ux - (W8[k + e] - x0) * uz);
+        if (along < -0.6 || along > len + 0.6 || off > 1.2) far = 1;
+        offMin = min(offMin, off);
+      }
+      if (far) continue;
+      near = min(near, offMin);
+      inLane[k / 5] = 1;
+    }
+    lanes.push(x0, z0, ux, uz, len, max(LANE_MIN, near - 0.22 - 0.3));
+  }
+  for (let k = 0; k < W8.length; k += 5) {
+    if (inLane[k / 5]) continue;
+    const i0 = cellOf(min(W8[k], W8[k + 2]), OX),
+      i1 = cellOf(max(W8[k], W8[k + 2]), OX),
+      j0 = cellOf(min(W8[k + 1], W8[k + 3]), OZ),
+      j1 = cellOf(max(W8[k + 1], W8[k + 3]), OZ);
+    for (let j = j0; j <= j1; j++)
+      for (let i = i0; i <= i1; i++)
+        walled[i + OBN * j].push(...W8.slice(k, k + 5));
+  }
+  // A step from (x0, z0) to (x, z) kept to the lanes: from within a lane, to within its room of its middle line,
+  // and in the funnel at each end within as much more as it is metres past the end (the funnel ends where it is
+  // 1.2 m wide). A walker beside a lane is not drawn into it. P2 = the point
+  function lane(x, z, x0, z0) {
+    for (let i = 0; i < lanes.length; i += 6) {
+      const ux = lanes[i + 2],
+        uz = lanes[i + 3],
+        len = lanes[i + 4],
+        room = lanes[i + 5],
+        wideAt = (along) => min(room + max(0, -along, along - len), 1.2),
+        along0 = (x0 - lanes[i]) * ux + (z0 - lanes[i + 1]) * uz,
+        off0 = (z0 - lanes[i + 1]) * ux - (x0 - lanes[i]) * uz,
+        along = (x - lanes[i]) * ux + (z - lanes[i + 1]) * uz,
+        off = (z - lanes[i + 1]) * ux - (x - lanes[i]) * uz,
+        wide = wideAt(along);
+      if (abs(off0) > wideAt(along0) + 1e-6 || wide >= 1.2 || abs(off) <= wide)
+        continue;
+      const o = off > 0 ? wide : -wide;
+      x = lanes[i] + ux * along - uz * o;
+      z = lanes[i + 1] + uz * along + ux * o;
+    }
+    P2[0] = x;
+    P2[1] = z;
+  }
+  // P2 = the point (x, z) moved out of every disc and wall around it, to `pad` beyond its radius: straight out
+  // from a wall, so along one it slides on a straight line. Again while a move put it into another (a corner)
   const P2 = new Float64Array(2);
   function shove(x, z, pad) {
     const gx = clamp(floor((x - OX) / OBW), 1, OBN - 2),
       gz = clamp(floor((z - OZ) / OBW), 1, OBN - 2);
-    for (let j = gz - 1; j <= gz + 1; j++)
-      for (let i = gx - 1; i <= gx + 1; i++) {
-        const a = obst[i + OBN * j];
-        for (let k = 0; k < a.length; k += 3) {
-          const dx = x - a[k],
-            dz = z - a[k + 1],
-            r = a[k + 2] + pad,
-            d2 = dx * dx + dz * dz;
-          if (d2 < r * r && d2 > 1e-6) {
-            const s = r / sqrt(d2);
-            x = a[k] + dx * s;
-            z = a[k + 1] + dz * s;
+    for (let pass = 0, moved = true; moved && pass < 4; pass++) {
+      moved = false;
+      for (let j = gz - 1; j <= gz + 1; j++)
+        for (let i = gx - 1; i <= gx + 1; i++) {
+          const a = obst[i + OBN * j];
+          for (let k = 0; k < a.length; k += 3) {
+            const dx = x - a[k],
+              dz = z - a[k + 1],
+              r = a[k + 2] + pad,
+              d2 = dx * dx + dz * dz;
+            if (d2 < r * r - 1e-9 && d2 > 1e-6) {
+              const s = r / sqrt(d2);
+              x = a[k] + dx * s;
+              z = a[k + 1] + dz * s;
+              moved = true;
+            }
+          }
+          const w = walled[i + OBN * j];
+          for (let k = 0; k < w.length; k += 5) {
+            const ex = w[k + 2] - w[k],
+              ez = w[k + 3] - w[k + 1],
+              t = clamp(
+                ((x - w[k]) * ex + (z - w[k + 1]) * ez) /
+                  (ex * ex + ez * ez || 1),
+                0,
+                1,
+              ),
+              qx = w[k] + ex * t,
+              qz = w[k + 1] + ez * t,
+              dx = x - qx,
+              dz = z - qz,
+              r = w[k + 4] + pad,
+              d2 = dx * dx + dz * dz;
+            if (d2 < r * r - 1e-9 && d2 > 1e-6) {
+              const s = r / sqrt(d2);
+              x = qx + dx * s;
+              z = qz + dz * s;
+              moved = true;
+            }
           }
         }
-      }
+    }
     P2[0] = x;
     P2[1] = z;
   }
@@ -1147,9 +1263,9 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   };
 
   await say('Building bridges…', 0.94, 1200);
-  // lv(low, medium, high): a value per detail level. Low is tuned for a phone, where the scene is bound by its
-  // triangle count: almost every distance below is where something swaps to a cheaper mesh or stops being drawn.
-  const lv = (low, medium, high) => (LV > 1 ? low : LV ? medium : high);
+  // lv(low, medium): a value per level. Low is tuned for a phone, where the scene is bound by its triangle count:
+  // almost every distance below is where something swaps to a cheaper mesh or stops being drawn.
+  const lv = (low, medium) => (MEDIUM ? medium : low);
   const meshes = [],
     KINDS = Array.from({ length: NTRUNK }, (_, k) => k);
   // add(...): appends meshes (built or not) and returns the id of the first
@@ -1186,11 +1302,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // (Low: the small rocks are 20 flat faces at every distance and the large rocks' near mesh is their middle one,
   // 80 flat faces: nothing swaps close by)
   const M_CHUNK = add(
-    meshChunk(3, LV > 1 ? 0 : 2),
-    meshChunk(11, LV > 1 ? 0 : 2),
+    meshChunk(3, MEDIUM ? 2 : 0),
+    meshChunk(11, MEDIUM ? 2 : 0),
     meshShroom(),
     ...[5, 17, 41].map((sd) =>
-      LV > 1 ? meshChunk(sd, 2, 1) : meshChunk(sd, 3),
+      MEDIUM ? meshChunk(sd, 3) : meshChunk(sd, 2, 1),
     ),
     meshChunk(9, 1),
     meshStick(),
@@ -1418,7 +1534,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     ibSmall = leafBuf(Wd.small),
     ibSmallF = leafBuf(Wd.smallF),
     ibBigL = leafBuf(Wd.bigL),
-    ibFarT = leafBuf(Wd.farT),
     ibLowM = leafBuf(Wd.lowM),
     ibSmallL = leafBuf(Wd.smallL);
   const ibFish = buf(Wd.fish, BU.VERTEX),
@@ -1607,14 +1722,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         r.setVertexBuffer(1, ibProp[i]);
         r.drawIndexed(t.ib.length, Wd.props[i].n, t.i0, t.v0, 0);
       }
-    // loose rocks and mushrooms only on High: too many triangles for a phone's driver
-    if (!LV)
-      for (let i = 0; i < NCHUNK; i++)
-        if (Wd.chunks[i].n) {
-          const t = meshes[M_CHUNK + i];
-          r.setVertexBuffer(1, ibChunk[i]);
-          r.drawIndexed(t.ib.length, Wd.chunks[i].n, t.i0, t.v0, 0);
-        }
     r.setPipeline(pLeafSh);
     r.setVertexBuffer(0, ibLow);
     r.draw(6, Wd.low.n);
@@ -1623,12 +1730,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     r.end();
     Q.submit([e.finish()]);
   }
-  // the GPU has its own copies now: let go of the generator's
+  // the GPU has its own copies now: let go of the generator's (but for the far pictures', sorted every frame)
   for (const o of [
     Wd.high,
     Wd.bigF,
     Wd.bigL,
-    Wd.farT,
     Wd.low,
     Wd.lowM,
     Wd.limb,
@@ -1671,6 +1777,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     Wd.cm =
     Wd.wood =
     Wd.blocks =
+    Wd.walls =
     T.vb =
     T.ib =
     T.wp =
@@ -1684,7 +1791,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // slow moment there never sticks.
   // phones may go lower in pixels and draw distance before the frame rate gives way: their GPUs run out first
   const PIXMAX = 2560 * 1440,
-    PIXMIN = mob ? 18e4 : 5e5;
+    PIXMIN = mob ? 18e4 : 5e5,
+    PIX0 = MEDIUM ? (mob ? 1280 * 720 : PIXMAX) : 41e4; // the level's own
   // a phone's 3x screen gains little over 2x in this soft, hazy scene, at more than twice the pixels
   const DPRMAX = 2;
   // tan of half the field of view: vertical TANH (set by resize) and the horizontal floor TANW for a tall screen
@@ -1695,7 +1803,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     H = 0,
     DW = 0,
     DH = 0,
-    pix = (!dev && +SV[1]) || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX),
+    pix = (!dev && SIZE) || PIX0,
     det = 1,
     dynN = 0,
     dynT = 0,
@@ -1704,6 +1812,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     dynBad = 0,
     dynOk = 0,
     dynWait = 3;
+  // Medium is judged in its first JUDGE s of measured frames: drawn under SLOW_SIZE of its own render size (as much
+  // of it as the screen has) for SLOW_FOR s in a row, or over budget at the smallest size as long, it is too slow,
+  // and this device runs Low from its next load on (quality.js)
+  const JUDGE = 60,
+    SLOW_SIZE = 0.7,
+    SLOW_FOR = 5;
+  let judged = MEDIUM ? 0 : JUDGE,
+    smallFor = 0,
+    starvedFor = 0;
   let passScene,
     passRays,
     passBlur,
@@ -1715,7 +1832,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     bloomPass = [],
     bloomBG = [],
     targets = [];
-  const NB = LV > 1 ? 4 : 6; // bloom levels: each is two render passes, and a phone GPU pays by the pass
+  const NB = MEDIUM ? 6 : 4; // bloom levels: each is two render passes, and a phone GPU pays by the pass
   function resize() {
     const dpr = min(devicePixelRatio, DPRMAX);
     DW = max(2, round(canvas.clientWidth * dpr));
@@ -1899,47 +2016,36 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // Exposure (W_POST): the old rule's, by how much sky reaches the walker, stopped down while the highlights in
   // view (W_METER, adapted) times it would go over HIGH: their value on the walk's opening view (debug.trail(0, 10),
   // clear, the eye settled: EXPO_OPEN), the brightest the scene allows; OPEN_HIGH, those highlights as
-  // debug.exposureNow measured them at each level (the mean of 40 s). For a comparison (debug.exposure 2) the average
-  // metering: the average brought to EXPO_KEY (OPEN_LUM likewise), within 1 / 2.5 to 1.6 of EXPO_OPEN
+  // debug.exposureNow measured them at each level (the mean of 40 s)
   const EXPO_OPEN = EXPO * (1 + 0.9 * MIST) * adaptAt(TRAIL[0][0], TRAIL[0][1]),
-    OPEN_HIGH = lv(0.4793, 0.482, 0.4806),
-    HIGH = EXPO_OPEN * OPEN_HIGH,
-    OPEN_LUM = lv(0.1891, 0.1879, 0.1872),
-    EXPO_KEY = EXPO_OPEN * OPEN_LUM;
-  // the exposure in use, by debug.exposure's mode, from the old rule's (place) and the values adapted to
-  const exposureOf = (place, lum, high) =>
-    expoMode === 1
-      ? place
-      : expoMode === 2
-        ? clamp(EXPO_KEY / lum, EXPO_OPEN / 2.5, EXPO_OPEN * 1.6)
-        : place * clamp(HIGH / (place * high), 0.4, 1);
+    OPEN_HIGH = lv(0.4654, 0.4677),
+    HIGH = EXPO_OPEN * OPEN_HIGH;
+  // the exposure in use, by debug.exposure's mode, from the old rule's (place) and the highlights adapted to
+  const exposureOf = (place, high) =>
+    expoMode ? place : place * clamp(HIGH / (place * high), 0.4, 1);
   const submitList = [null];
   const rowOrd = new Uint8Array(CELLS);
   // Where things swap meshes or stop (metres, scaled by `det` like every distance but the ground's and the trees')
-  const TERR_FAR = lv([34, 60], [44, 68], [52, 76]); // ground: to its 1/4 and 1/16 meshes
+  const TERR_FAR = lv([34, 60], [44, 68]); // ground: to its 1/4 and 1/16 meshes
   // (the far meshes come in deep in the fog, where the change of outline is a pixel or two)
-  const BOULDER = lv([14, 40], [14, 56], [14, 60]); // boulders, logs and stumps: to their middle mesh, then the far one
-  const CHUNK = lv([12, 16, 40], [16, 16, 56], [16, 20, 60]); // small rocks and mushrooms to their 20-odd triangles; large rocks to 1/4, then to 20
-  const CHUNK_END = lv(48, 96, 96); // small rocks and mushrooms stop here (world.js gives the rocks the same fade)
-  const PEBBLE = lv([1, 12], [1, 24], [1, 30]); // pebbles: as 20 triangles?, and how far
-  const FLY_NEAR = lv(20, 50, 80),
-    GLINT_END = lv(60, 90, 90);
-  const SPRITES = lv(
-    [2500, 3500, 500, 260],
-    [6000, 7000, 900, 500],
-    [6000, 7000, 900, 500],
-  ); // dust, raindrops, falling leaves, drips (of Wd.snow)
+  const BOULDER = lv([14, 40], [14, 56]); // boulders, logs and stumps: to their middle mesh, then the far one
+  const CHUNK = lv([12, 16, 40], [16, 16, 56]); // small rocks and mushrooms to their 20-odd triangles; large rocks to 1/4, then to 20
+  const CHUNK_END = lv(48, 96); // small rocks and mushrooms stop here (world.js gives the rocks the same fade)
+  const PEBBLE = lv([1, 12], [1, 24]); // pebbles: as 20 triangles?, and how far
+  const FLY_NEAR = lv(20, 50),
+    GLINT_END = lv(60, 90);
+  const SPRITES = lv([2500, 3500, 500, 260], [6000, 7000, 900, 500]); // dust, raindrops, falling leaves, drips (of Wd.snow)
   // D(v): where the fog of the moment lets v through along a level ray (hazeT in S_G, from G.wx.w and G.st.y)
   const hazeNow = () =>
     FOG + 0.006 * F[OVER] + 0.009 * F[RAIN] + 0.046 * F[FOGK];
   const fogV = (d) => exp(-((hazeNow() * d) ** (1.7 - 0.4 * F[FOGK])));
+  // and closed (hazeT: by the ray's length, from LOD.close[0] to [1])
+  const fogT = (d) => fogV(d) * (1 - sstep(LOD.close[0], LOD.close[1], d));
   const fogD = (v) => (-Math.log(v)) ** (1 / (1.7 - 0.4 * F[FOGK])) / hazeNow();
-  // a store's distances for its V (W_LEAF thinD): where its thinning starts and ends, and the band its last cards
-  // end in (drawn in to end by FOG_END, were the fog ever that thin)
-  const fades = (V, o) => {
-    const q = min(1, FOG_END / fogD(V[3]));
-    for (let i = 0; i < 4; i++) o[i] = fogD(V[i]) * (i > 1 ? q : 1);
-  };
+  // the same on a clear day (its haze: FOG and MIST's overcast), for the thinning that keeps to it
+  const clearD = (v) => (-Math.log(v)) ** (1 / 1.7) / (FOG + 0.006 * MIST);
+  const TREE_CLEAR = [clearD(TREE_FADE[0]), clearD(TREE_FADE[1]), 0, 0],
+    SHRUB_CLEAR = SHRUB_FADE.map(clearD);
   // where a store's share kept (W_LEAF thin) has fallen to k: the inverse of mix(K0, KMIN, ss(from, to, d))
   const shareAt = (s, d, k) => {
     const f = clamp((s.K0 - k) / (s.K0 - s.KMIN), 0, 1);
@@ -1966,24 +2072,36 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const SMALL_D = [THIN_SMALL.PD1, THIN_SMALL.PD2],
     SMALL_F = cutAt(THIN_SMALL, SMALL_D, 0.53),
     SMALL_L = cutAt(THIN_SMALL, SMALL_D, 0.18);
-  // The fog's distances now (G.lt, G.ls, G.lf.xy) and the cuts of LEAVES that follow them, for every frame. The
-  // far trees' pictures are drawn from 12 m before they come in
-  const LOD = { tree: [0, 0, 0, 0], shrub: [0, 0, 0, 0], far: [0, 0] },
+  // The fog's distances now (G.lt, G.ls, G.lf) and the cuts of LEAVES that follow them, for every frame. The far
+  // trees' pictures (far: where they begin to come in and are whole, as the trees' cards thin) are drawn to where
+  // the fog has closed (farSorted); so are the ground plants, a card's reach (2.5 m) on. (The fog's close is drawn
+  // in to end by FOG_END, were it ever that thin)
+  const LOD = {
+      tree: new Float64Array(4),
+      shrub: new Float64Array(4),
+      far: TREE_CLEAR.slice(0, 2),
+      close: [0, 0],
+    },
     TIER = {};
   const lodNow = () => {
     const t = LOD.tree,
       s = LOD.shrub;
-    fades(TREE_FADE, t);
-    fades(SHRUB_FADE, s);
-    LOD.far[0] = fogD(FAR_FADE[0]);
-    LOD.far[1] = fogD(FAR_FADE[1]);
-    TIER.lowM = max(NEAR_D, cutAt(THIN_TREE, t, 0.75));
-    TIER.bigF = max(TIER.lowM, cutAt(THIN_TREE, t, 0.53));
-    TIER.bigL = cutAt(THIN_TREE, t, 0.27);
-    TIER.tree = t[3];
-    TIER.farT = LOD.far[0] - 12;
-    TIER.shrubF = max(NEAR_D, cutAt(THIN_SHRUB, s, 0.53));
-    TIER.shrub = s[3];
+    const q = min(1, FOG_END / fogD(CLOSE[1]));
+    LOD.close[0] = fogD(CLOSE[0]) * q;
+    LOD.close[1] = fogD(CLOSE[1]) * q;
+    // the clear day's thinning; the trees' cards end in the closed fog, the shrubs' as on a clear day or there
+    t.set(TREE_CLEAR);
+    t[2] = LOD.close[1];
+    t[3] = FOG_END + 1;
+    s.set(SHRUB_CLEAR);
+    TIER.plant = min(PLANT_END, LOD.close[1] + 2.5);
+    TIER.tree = drawEnd(5);
+    TIER.lowM = min(max(NEAR_D, cutAt(THIN_TREE, t, 0.75)), TIER.tree);
+    TIER.bigF = min(max(TIER.lowM, cutAt(THIN_TREE, t, 0.53)), TIER.tree);
+    TIER.bigL = min(cutAt(THIN_TREE, t, 0.27), TIER.tree);
+    TIER.farEnd = drawEnd(9);
+    TIER.shrub = min(s[3], drawEnd(2.5));
+    TIER.shrubF = min(max(NEAR_D, cutAt(THIN_SHRUB, s, 0.53)), TIER.shrub);
   };
   // leaves: pipeline, buffer, set, margin, vertices per blade, from, to (metres, or the name of a cut in TIER). A
   // tree's or a shrub's card is SPRIGS quads within NEAR_D and its first two beyond (W_LEAF vsN: the others are
@@ -1998,19 +2116,66 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     [pLeafM, ibHigh, Wd.high, 5, 12, 0, 'bigF'],
     [pLeafM, ibBigF, Wd.bigF, 5, 12, 'bigF', 'bigL'],
     [pLeafM, ibBigL, Wd.bigL, 5, 12, 'bigL', 'tree'],
-    [pLeafF, ibFarT, Wd.farT, 9, 4, 'farT', FOG_END],
     [pLeafMS, ibShrub, Wd.shrub, 2.5, SPRIGS * 6, 0, NEAR_D],
     [pLeafMS, ibShrub, Wd.shrub, 2.5, 12, NEAR_D, 'shrubF'],
     [pLeafMS, ibShrubF, Wd.shrubF, 2.5, 12, 'shrubF', 'shrub'],
     [pLeafL, ibLimb, Wd.limb, 5, 6, 0, 'tree'],
     [pLeafS, ibSmall, Wd.small, 2.5, 6, 0, SMALL_F],
     [pLeafS, ibSmallF, Wd.smallF, 2.5, 6, SMALL_F, SMALL_L],
-    [pLeafS, ibSmallL, Wd.smallL, 2.5, 6, SMALL_L, PLANT_END],
+    [pLeafS, ibSmallL, Wd.smallL, 2.5, 6, SMALL_L, 'plant'],
   ];
   const tierAt = (x) => (typeof x === 'string' ? TIER[x] : x);
+  // where solids stop being drawn: FOG_END, or where the fog has closed over all of them (mar: their reach)
+  const drawEnd = (mar) => min(FOG_END, LOD.close[1] + mar);
   // one level of detail of a cell-sorted set of solids: `mesh` for the cells within [from, to)
   const tier = (r, set, mesh, mar, from, to) => {
     if (to > from) drawCells(r, set, mar, mesh, 0, from, to);
+  };
+  // The far pictures to blend in this frame where the fog closes: those in view from where they begin to come in
+  // to where the fog has closed over them (TIER.farEnd), far to near, into vbFar (world.js farT's records: crown
+  // foot, height; yaw, tilt, width, height up its tree; kind and seeds as bytes). Returns how many
+  const farF = new Float32Array(Wd.farT.buf),
+    farB = new Uint8Array(Wd.farT.buf),
+    vbFar = device.createBuffer({
+      size: max(Wd.farT.n * 36, 4),
+      usage: BU.VERTEX | BU.COPY_DST,
+    }),
+    farOut = new Uint8Array(Wd.farT.n * 36),
+    farK = new Uint32Array(Wd.farT.n),
+    farD = new Float32Array(Wd.farT.n);
+  let farN = 0;
+  const farSorted = () => {
+    const from = LOD.far[0],
+      to = TIER.farEnd,
+      cx = F[CX],
+      cz = F[CZ];
+    let n = 0;
+    for (let c = 0; c < CELLS * CELLS; c++) {
+      if (!vis[c] && !ISO[3]) continue;
+      const px = abs(OX + ((c % CELLS) + 0.5) * CELLW - cx),
+        pz = abs(OZ + (floor(c / CELLS) + 0.5) * CELLW - cz);
+      if (
+        hypot(max(px - CELLW / 2, 0), max(pz - CELLW / 2, 0)) >= to ||
+        hypot(px + CELLW / 2, pz + CELLW / 2) < from
+      )
+        continue;
+      for (let k = Wd.farT.start[c]; k < Wd.farT.start[c + 1]; k++) {
+        const x = farF[k * 9],
+          z = farF[k * 9 + 2],
+          h = farF[k * 9 + 3],
+          d = hypot(x - cx, z - cz);
+        if (d < from || d >= to) continue;
+        if (seen(x, farF[k * 9 + 1] + h / 2, z, (h + farF[k * 9 + 6]) / 2) < 0)
+          continue;
+        farD[k] = d;
+        farK[n++] = k;
+      }
+    }
+    farK.subarray(0, n).sort((a, b) => farD[b] - farD[a]);
+    for (let j = 0; j < n; j++)
+      farOut.set(farB.subarray(farK[j] * 36, farK[j] * 36 + 36), j * 36);
+    if (n) Q.writeBuffer(vbFar, 0, farOut, 0, n * 36);
+    return n;
   };
   // How far a sphere is (0 inside it) when any of it is in view, else -1.
   function seen(x, y, z, rad) {
@@ -2070,7 +2235,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         const c = row + x,
           l = lo[c],
           h = hi[c];
-        if (l > h || (indexed !== 1 && !vis[c])) continue;
+        // (debug.isolate shows its tree whatever would hide it)
+        if (l > h || (indexed !== 1 && !vis[c] && !ISO[3])) continue;
         const px = OX + (x + 0.5) * CELLW - cx,
           hx = max(abs(px) - hw, 0),
           near2 = hx * hx + hz * hz;
@@ -2310,8 +2476,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       over = F[OVER];
     m[51] = over;
     m[56] =
-      EXPO * (1 + 0.9 * over) * (1 - 0.22 * F[STORM]) * (F[ADAPT] || adaptTo());
-    m[57] = RAYS;
+      ISO[3] === 2
+        ? EXPO_OPEN
+        : EXPO *
+          (1 + 0.9 * over) *
+          (1 - 0.22 * F[STORM]) *
+          (F[ADAPT] || adaptTo());
+    // (a tree shown alone and shaded: no shafts, the opening view's exposure, held)
+    m[57] = ISO[3] === 2 ? 0 : RAYS;
     m[58] = det;
     m[59] = sprigsMode;
     m[60] = F[WET];
@@ -2338,16 +2510,18 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     lodNow();
     m.set(LOD.tree, 76);
     m.set(LOD.shrub, 80);
-    m.set(LOD.far, 84);
-    // ex: the average metering's key and bounds, which exposure (debug.exposure); ea: the frame's seconds, 1 to
-    // take its measure at once, the highlights' key
-    m[88] = EXPO_KEY;
-    m[89] = EXPO_OPEN / 2.5;
-    m[90] = EXPO_OPEN * 1.6;
-    m[91] = expoMode;
+    m[84] = LOD.far[0];
+    m[85] = LOD.far[1];
+    m.set(LOD.close, 86);
+    // ex: the highlights' key, 1 for the old exposure rule (debug.exposure); ea: the frame's seconds, 1 to take its
+    // measure at once
+    m[88] = HIGH;
+    m[89] = ISO[3] === 2 ? 1 : expoMode;
+    m[90] = isoPart;
     m[92] = frameDt;
     m[93] = meterNew ? 1 : 0;
-    m[94] = HIGH;
+    // dbg: debug.isolate
+    m.set(ISO, 96);
     meterNew = false;
     Q.writeBuffer(ubo, 0, UB);
     WT[0] = F[TIME];
@@ -2390,6 +2564,48 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     }
     // scene
     r = e.beginRenderPass(passScene);
+    // (debug.isolate: only its tree, on black; the vertex shaders leave out every other card and solid)
+    const alone = ISO[3] > 0;
+    // the signposts' lettering, the falling leaves, the sky, a bolt, the lake and the streams
+    const backdrop = () => {
+      // the signposts' lettering, over their boards
+      r.setPipeline(pSign);
+      r.setBindGroup(1, bgSign);
+      r.setVertexBuffer(0, vbSign);
+      r.draw(4, nSign);
+      drawN++;
+      // falling leaves (opaque), the sky behind everything, then the lake's water blended over its bed
+      r.setPipeline(pFall);
+      r.setVertexBuffer(0, ibSnowB);
+      r.draw(4, SPRITES[2]);
+      drawN++;
+      triBy[5] += SPRITES[2] * 2;
+      r.setPipeline(pBack);
+      r.draw(4);
+      // a bolt of lightning, on the sky: behind everything else, and under the rain drawn after it
+      if (FL[3] > 1 && boltN && flick.length && flashAge() < 2.5) {
+        r.setPipeline(pBolt);
+        r.setVertexBuffer(0, vbBolt);
+        r.draw(4, boltN);
+        drawN++;
+        triBy[5] += boltN * 2;
+      }
+      r.setPipeline(pSurf);
+      r.draw(4);
+      // a soft dark patch on the lake under the boat and round each pile
+      r.setPipeline(pBlot);
+      r.setVertexBuffer(0, vbWaterBlot);
+      r.draw(4, 3 + Wd.boat.piles.length);
+      drawN++;
+      // the running water: one mesh for both streams (a few thousand triangles, so it is not culled)
+      r.setPipeline(pStream);
+      r.setVertexBuffer(0, vbWater);
+      r.setIndexBuffer(ibWater, 'uint32');
+      r.drawIndexed(nWater);
+      drawN++;
+      triBy[0] += nWater / 3;
+    };
+
     r.setBindGroup(0, bg0);
     // The ground: each far level starts one ring of cells early, under the finer one, which hides the cracks. The
     // last goes on a little past where the fog has taken everything else
@@ -2432,7 +2648,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         drawN++;
         if (auditCur) auditCur.runs.push(from, to);
       };
-      auditCur = auditing ? auditNote(woodAt, 0, FOG_END) : null;
+      auditCur = auditing ? auditNote(woodAt, 0, drawEnd(0)) : null;
       for (let c = 0; c < CELLS * CELLS; c++) {
         const a = woodAt[c],
           b = woodAt[c + 1];
@@ -2443,7 +2659,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           OZ + (floor(c / CELLS) + 0.5) * CELLW,
           CELLW * 0.85,
         );
-        if (d < 0 || d > FOG_END) continue;
+        if (d < 0 || d > drawEnd(0)) continue;
         if (to !== a) {
           if (from >= 0) run();
           from = a;
@@ -2458,14 +2674,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       r.setVertexBuffer(1, ibBoulder[i]);
       tier(r, c, meshes[i], 7, 0, BOULDER[0]);
       tier(r, c, meshes[M_BOULDER_MID + i], 7, BOULDER[0], BOULDER[1]);
-      tier(r, c, meshes[M_BOULDER_FAR + i], 7, BOULDER[1], FOG_END / det);
+      tier(r, c, meshes[M_BOULDER_FAR + i], 7, BOULDER[1], drawEnd(7) / det);
     }
     // trunks, to the fog's end: one mesh at every distance
     cat = 2;
     for (let i = 0; i < NTRUNK; i++) {
       const c = Wd.props[i];
       r.setVertexBuffer(1, ibProp[i]);
-      tier(r, c, meshes[M_TRUNK + i], 8, 0, FOG_END / det);
+      tier(r, c, meshes[M_TRUNK + i], 8, 0, drawEnd(8) / det);
     }
     // the bark's shell on the trunks close by (W_SOLID vsShell)
     r.setPipeline(pShell);
@@ -2479,12 +2695,19 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       const c = Wd.chunks[i];
       r.setVertexBuffer(1, ibChunk[i]);
       if (i > 7) {
-        tier(r, c, meshes[M_CHUNK + i], 3, 0, FOG_END);
+        tier(r, c, meshes[M_CHUNK + i], 3, 0, drawEnd(3));
         continue;
       } // stepping stones: one mesh at every distance
       if (i > 6) {
         tier(r, c, meshes[M_CHUNK + i], 3, 0, CHUNK[0] + 2);
-        tier(r, c, meshes[M_TINY + i], 3, CHUNK[0] + 2, CHUNK_END);
+        tier(
+          r,
+          c,
+          meshes[M_TINY + i],
+          3,
+          CHUNK[0] + 2,
+          min(CHUNK_END, drawEnd(3)),
+        );
         continue;
       } // fallen branches
       if (i > 5) {
@@ -2493,12 +2716,12 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       }
       if (i < 3) {
         tier(r, c, meshes[M_CHUNK + i], 3, 0, CHUNK[0]);
-        tier(r, c, meshes[M_TINY + i], 3, CHUNK[0], CHUNK_END);
+        tier(r, c, meshes[M_TINY + i], 3, CHUNK[0], min(CHUNK_END, drawEnd(3)));
         continue;
       }
       tier(r, c, meshes[M_CHUNK + i], 3, 0, CHUNK[1]);
       tier(r, c, meshes[M_CHUNK_MID + i - 3], 3, CHUNK[1], CHUNK[2]);
-      tier(r, c, meshes[M_TINY + i], 3, CHUNK[2], FOG_END);
+      tier(r, c, meshes[M_TINY + i], 3, CHUNK[2], drawEnd(3));
     }
     // the animals: under a hundred instances, so every group is drawn
     {
@@ -2542,7 +2765,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     // family's on vsJay); then the sticks under those that sit on a dead branch, after them in the same buffer
     let nBirds = 0;
     for (let slot = 0; slot < 6; slot++) nBirds += birds.counts[slot];
-    if (nBirds) {
+    if (nBirds && !alone) {
       r.setVertexBuffer(1, ibBird);
       for (let slot = 0, first = 0; slot < 6; first += birds.counts[slot++]) {
         const mesh = meshes[M_SONG + slot],
@@ -2569,6 +2792,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     // leaves: fewer rows per blade with distance, then thinned-out sets
     for (let i = 0; i < LEAVES.length; i++) {
       const t = LEAVES[i];
+      tierTris[i] = 0;
       r.setPipeline(t[0]);
       r.setVertexBuffer(0, t[1]);
       cat = t[0] === pLeafS || t[0] === pLeafMS || t[1] === ibShrub ? 4 : 3;
@@ -2577,56 +2801,37 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       tierTris[i] = triBy[cat] - before;
     }
     // a dark blot under each bird on the ground
-    if (birds.counts[6]) {
+    if (birds.counts[6] && !alone) {
       r.setPipeline(pBlot);
       r.setVertexBuffer(0, vbBlot);
       r.draw(4, birds.counts[6]);
       drawN++;
     }
-    // the signposts' lettering, over their boards
-    r.setPipeline(pSign);
-    r.setBindGroup(1, bgSign);
-    r.setVertexBuffer(0, vbSign);
-    r.draw(4, nSign);
-    drawN++;
-    // falling leaves (opaque), the sky behind everything, then the lake's water blended over its bed
-    r.setPipeline(pFall);
-    r.setVertexBuffer(0, ibSnowB);
-    r.draw(4, SPRITES[2]);
-    drawN++;
-    triBy[5] += SPRITES[2] * 2;
-    r.setPipeline(pBack);
-    r.draw(4);
-    // a bolt of lightning, on the sky: behind everything else, and under the rain drawn after it
-    if (FL[3] > 1 && boltN && flick.length && flashAge() < 2.5) {
-      r.setPipeline(pBolt);
-      r.setVertexBuffer(0, vbBolt);
-      r.draw(4, boltN);
-      drawN++;
-      triBy[5] += boltN * 2;
+    // (none of it with a tree alone, but the sky shaded: fsB)
+    if (!alone) backdrop();
+    else if (ISO[3] === 2) {
+      r.setPipeline(pBack);
+      r.draw(4);
     }
-    r.setPipeline(pSurf);
-    r.draw(4);
-    // a soft dark patch on the lake under the boat and round each pile
-    r.setPipeline(pBlot);
-    r.setVertexBuffer(0, vbWaterBlot);
-    r.draw(4, 3 + Wd.boat.piles.length);
-    drawN++;
-    // the running water: one mesh for both streams (a few thousand triangles, so it is not culled)
-    r.setPipeline(pStream);
-    r.setVertexBuffer(0, vbWater);
-    r.setIndexBuffer(ibWater, 'uint32');
-    r.drawIndexed(nWater);
-    drawN++;
-    triBy[0] += nWater / 3;
+    // the far trees' pictures, blended over everything opaque and the water (which writes no depth: a tree before
+    // it must come after it), far to near
+    // (none where the fog has closed before they begin to come in)
+    farN = LOD.close[1] > LOD.far[0] ? farSorted() : 0;
+    if (farN) {
+      r.setPipeline(pLeafFB);
+      r.setVertexBuffer(0, vbFar);
+      r.draw(4, farN);
+      drawN++;
+      triBy[3] += farN * 2;
+    }
     // lights added on top: fireflies, dust in the sun, rain
-    if (ANIMALS) {
+    if (ANIMALS && !alone) {
       r.setPipeline(pGl);
       r.setVertexBuffer(0, ibGl);
       drawCells(r, Wd.glints, 2, false, 4, 0, GLINT_END);
     }
     r.setVertexBuffer(0, ibSnowB);
-    if (rain < 0.25 && fogK < 0.99) {
+    if (rain < 0.25 && fogK < 0.99 && !alone) {
       r.setPipeline(pSnow);
       r.draw(4, SPRITES[0]);
       drawN++;
@@ -2634,7 +2839,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     }
     // the rain: its sheets of streaks further off, the drops near the walker, the drips under the crowns (these
     // for as long as the leaves are wet)
-    if (rain > 0.01) {
+    if (rain > 0.01 && !alone) {
       r.setPipeline(pVeil);
       r.draw(42, 2);
       r.setPipeline(pRain);
@@ -2642,7 +2847,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       drawN += 2;
       triBy[5] += 80 + SPRITES[1] * 2;
     }
-    if (rain > 0.01 || F[WET] > 0.05) {
+    if ((rain > 0.01 || F[WET] > 0.05) && !alone) {
       r.setPipeline(pDrip);
       r.draw(4, SPRITES[3]);
       drawN++;
@@ -2788,7 +2993,10 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const FL = new Float32Array(5);
   let flashDue = 0;
   let clockHeld = false; // the scene's clock stands still (debug.clock: stills an exact time apart)
+  const ISO = new Float32Array(4); // debug.isolate: x, z, reach, 1 a white mask, 2 shaded on black
+  let isoPart = 0; // and 1 the tree without its far picture, 2 the far picture alone
   let sprigsMode = 0; // debug.sprigs: 1 no sub-cards drawn near the walker, 2 all held flat on their cards
+  let pixHeld = false; // debug.pixels: the render size held
   let flickRise = 0.012,
     flickFall = 0.11;
   // A bolt is a tree of channels, grown afresh for every flash (growBolt) into BOLT: a segment in eight numbers,
@@ -3189,14 +3397,16 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       h0 = ground(x0, z0),
       len = sqrt(dx * dx + dz * dz);
     if (len < 1e-6) return;
-    let x = x0 + dx,
-      z = z0 + dz;
+    lane(x0 + dx, z0 + dz, x0, z0);
+    let x = P2[0],
+      z = P2[1];
     if (!passable(x, z, x0, z0, h0, len)) {
       if (passable(x, z0, x0, z0, h0, len)) z = z0;
       else if (passable(x0, z, x0, z0, h0, len)) x = x0;
       else return;
     }
     shove(x, z, 0.3);
+    lane(P2[0], P2[1], x0, z0);
     if (!passable(P2[0], P2[1], x0, z0, h0, len + 0.4)) return;
     F[CX] = P2[0];
     F[CZ] = P2[1];
@@ -3228,7 +3438,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     const now = performance.now(),
       fps = (stN * 1000) / max(now - stAt, 1),
       gpu = hasTS ? ` · gpu ${F[GPU].toFixed(1)}ms` : '';
-    const line = `${fps.toFixed(0)} fps · worst ${stWorst.toFixed(0)}ms${gpu} · cpu ${cpuMs.toFixed(1)}ms · ${CATS.map((c, k) => `${c} ${(triBy[k] / 1e3) | 0}k`).join(', ')} tris in ${drawN} draws · ${visN}/${CELLS * CELLS} cells · ${W}x${H} (${((W * H * 100) / (DW * DH)).toFixed(0)}%) · far ${(det * 100).toFixed(0)}% · ${['High', 'Medium', 'Low'][LV]}`;
+    const line = `${fps.toFixed(0)} fps · worst ${stWorst.toFixed(0)}ms${gpu} · cpu ${cpuMs.toFixed(1)}ms · ${CATS.map((c, k) => `${c} ${(triBy[k] / 1e3) | 0}k`).join(', ')} tris in ${drawN} draws · ${visN}/${CELLS * CELLS} cells · ${W}x${H} (${((W * H * 100) / (DW * DH)).toFixed(0)}%) · far ${(det * 100).toFixed(0)}% · ${LEVEL}`;
     stN = 0;
     stWorst = 0;
     stAt = now;
@@ -3244,14 +3454,30 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     if (dt > 0.1) dt = 0.1;
     frameDt = dt;
     // Dynamic resolution for 60 fps: every second (0.4 s for the first few, to settle fast) scale the load by k
+    // (held while debug.isolate shows a tree alone, or debug.pixels holds a size: frames to compare)
     if (
+      !ISO[3] &&
+      !pixHeld &&
       dtr < 1e3 &&
       (dynT += dtr) > 0 &&
       (dynN++, dynT > (tunes < 6 ? 400 : 1000))
     ) {
       tunes++;
-      const a = dynT / dynN,
-        g = dynGN ? dynG / dynGN : 0;
+      // (SLOW, dev: every frame taken as 20 ms longer, to try the demotion)
+      const late = SLOW ? 20 : 0,
+        a = dynT / dynN + late,
+        g = dynGN ? dynG / dynGN + late : 0;
+      if (judged < JUDGE) {
+        const span = dynT / 1000,
+          over = g ? g > 13.6 : a > 17.6;
+        judged += span;
+        smallFor = W * H < SLOW_SIZE * min(PIX0, DW * DH) ? smallFor + span : 0;
+        starvedFor = over && pix <= PIXMIN ? starvedFor + span : 0;
+        if (smallFor >= SLOW_FOR || starvedFor >= SLOW_FOR) {
+          demote('slow');
+          judged = JUDGE;
+        }
+      }
       let k = 1;
       // with GPU timing: keep it between 9.8 and 13.6 ms
       if (g) {
@@ -3287,7 +3513,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         if (k < 1 ? pix < end : pix > end) pix = end;
       }
       if (!dev && was !== pix + det)
-        keep('forest', [LV, pix < top ? pix | 0 : '', det]); // nothing kept at full resolution
+        keep('forestSize', [LEVEL, pix < top ? pix | 0 : '']); // nothing kept at full resolution
       dynN = dynT = dynG = dynGN = 0;
       resize();
     }
@@ -3506,7 +3732,12 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   await say('Letting the light in…', 1, 400);
   render();
   await Q.onSubmittedWorkDone();
-  setTimeout(keep, 15e3, 'forestLoad', ''); // the load counts as survived after 15 s of frames
+  // (the load counts as survived after 15 s of frames)
+  setTimeout(() => {
+    loading = false;
+    markLoad();
+    document.removeEventListener('visibilitychange', markLoad);
+  }, 15e3);
   // wake: the first touch starts the sound (browsers allow audio only after a gesture)
   // debug: for looking around from a debugger. view(i) jumps to one of the six viewpoints, look(x, y, z, tx, ty, tz)
   // to any place and target, stand(x, z, tx, tz) on the ground at a place facing another, weather(name) holds a state
@@ -3597,7 +3828,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       // (read back from the GPU, for a debugger only)
       exposureNow: async () => {
         const b = device.createBuffer({
-            size: 8,
+            size: 4,
             usage: BU.COPY_DST | BU.MAP_READ,
           }),
           e = device.createCommandEncoder(),
@@ -3609,9 +3840,40 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         );
         Q.submit([e.finish()]);
         await b.mapAsync(GPUMapMode.READ);
-        const [lum, high] = new Float32Array(b.getMappedRange());
+        const high = new Float32Array(b.getMappedRange())[0];
         b.destroy();
-        return [lum, high, exposureOf(old, lum, high), old, HIGH];
+        return [high, exposureOf(old, high), old, HIGH];
+      },
+      // (one tree alone, white on black, for measuring how much it covers: W_POST)
+      isolate: (x, z, reach, shaded, part) => {
+        ISO[3] = x === undefined ? 0 : shaded ? 2 : 1;
+        isoPart = ISO[3] ? ({ near: 1, far: 2 }[part] ?? 0) : 0;
+        if (!ISO[3]) return null;
+        ISO[0] = x;
+        ISO[1] = z;
+        ISO[2] = reach ?? 3;
+        // the nearest far picture (world.js farT): its kind (atlas.js farTree) and its crown's foot and height
+        let best = null,
+          bd = 1e9;
+        for (let k = 0; k < Wd.farT.n; k++) {
+          const d = hypot(farF[k * 9] - x, farF[k * 9 + 2] - z);
+          if (d < bd) {
+            bd = d;
+            best = [
+              floor((farB[k * 36 + 35] / 255) * 8),
+              ...farF.subarray(k * 9, k * 9 + 4),
+            ];
+          }
+        }
+        return best;
+      },
+      pixels: (n) => {
+        pixHeld = n > 0;
+        if (pixHeld) {
+          pix = n;
+          resize();
+        }
+        return W * H;
       },
       sprigs: (mode) => {
         if (mode !== undefined) sprigsMode = mode;
@@ -3624,6 +3886,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         for (const k in cuts) cuts[k] = m1(cuts[k]);
         return {
           tree: LOD.tree.map(m1),
+          close: LOD.close.map(m1),
+          closed: [LOD.tree[0], LOD.tree[1], TIER.tree, TIER.farEnd].map(
+            (d) => round(fogT(d) * 1e4) / 1e4,
+          ),
+          treeEnd: m1(TIER.tree),
+          farEnd: m1(TIER.farEnd),
+          farN,
           shrub: [LOD.shrub[0], LOD.shrub[1], LOD.shrub[3]].map(m1),
           far: LOD.far.map(m1),
           whole: [

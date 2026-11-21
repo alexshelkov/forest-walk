@@ -231,7 +231,7 @@ fn out(px: Px, cpx: f32, r: f32) -> vec4f { return vec4f(px.c, clamp(.5 + px.d *
 @fragment fn fs1(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let g = fc.xy / NPX * 4.; let c = floor(g); let p = g - c; let id = i32(c.x + c.y * 4.);
   var px = Px(-1., vec3f(.7, .3, 1.));
-  if (id < 6) { px = made(p, 4 + id, vec3f(.7, .3, 1.), R0, NPX * .25, .06); }
+  if (id < 6) { px = made(p, 4 + id, vec3f(.7, .3, 1.), R0, NPX * .25, .14); }
   else if (id <= 10) { px = made(p, 4 + id, vec3f(.8, .5, 1.), R0, NPX * .25, 0.); }
   return out(px, NPX * .25, R1);
 }
@@ -240,7 +240,7 @@ fn out(px: Px, cpx: f32, r: f32) -> vec4f { return vec4f(px.c, clamp(.5 + px.d *
   if (uv.y < .5) {
     // boughs: 0 and 1 a fir's, 2 a hemlock's, 3 a cedar's
     let c = floor(uv.x * 4.); let p = vec2f(uv.x * 4. - c, uv.y * 4.); let id = i32(c);
-    return out(made(p, id, vec3f(.7, .3, 1.), R1, NPX * .25, .03), NPX * .25, R2);
+    return out(made(p, id, vec3f(.7, .3, 1.), R1, NPX * .25, .12), NPX * .25, R2);
   }
   if (uv.y < .75) {
     let c = floor(uv.x * 8.); let p = vec2f(uv.x * 8. - c, (uv.y - .5) * 8.);
@@ -249,3 +249,48 @@ fn out(px: Px, cpx: f32, r: f32) -> vec4f { return vec4f(px.c, clamp(.5 + px.d *
   return vec4f(.7, .3, 1., 0.);
 }
 `;
+
+// A conifer's far picture's outline (farTree above, its noise left at its mean): how far out its boughs show at
+// each height, mean of its two sides, in the picture's widths, at 201 heights from its foot (0) to its top (y 2).
+// world.js grows the real crown to it, so the tree near the walker fills what its picture does far off
+const fract = (x) => x - Math.floor(x);
+const h1 = (x) => {
+  let q = fract(x * 0.1031 + 0.137);
+  q *= q + 33.33;
+  q *= q + q;
+  return fract(q);
+};
+export const farOutline = (kind) => {
+  const sd = kind * 1.7 + 2,
+    top = kind === 1 ? 1.5 : 1.93,
+    n = kind === 4 ? 7 : 15,
+    sides = [new Float32Array(201), new Float32Array(201)];
+  for (let k = 0; k < n; k++)
+    for (let s = 0; s < 2; s++) {
+      const hk = h1((k * 2 + s) * 3.1 + sd * 13),
+        tt = (k + 0.5 * hk) / n,
+        hy = 0.04 + (top - 0.1) * tt,
+        wk =
+          (0.44 * (1 - 0.92 * tt ** 0.8) + 0.035) *
+          (0.55 + 0.6 * hk) *
+          (kind === 3 ? 0.8 : kind === 4 ? 0.55 : 1);
+      for (let i = 0; i <= 100; i++) {
+        const u = i / 100,
+          yb =
+            kind === 2
+              ? hy + wk * ((-0.7 + 0.8 * tt) * u - 0.7 * u * u)
+              : kind === 3
+                ? hy + wk * (-0.9 * u + 0.75 * u * u * u)
+                : hy + wk * ((-0.5 + 0.85 * tt) * u - 0.5 * u * u),
+          thick = (0.03 + 0.07 * Math.sin(Math.PI * u ** 1.2)) * 1.1;
+        // (a bough's band: thick - |y - yb + thick / 2| over 0)
+        for (
+          let r = Math.max(0, Math.ceil((yb - 1.5 * thick) * 100));
+          r <= Math.min(200, Math.floor((yb + 0.5 * thick) * 100));
+          r++
+        )
+          sides[s][r] = Math.max(sides[s][r], u * wk);
+      }
+    }
+  return sides[0].map((v, r) => (v + sides[1][r]) / 2);
+};

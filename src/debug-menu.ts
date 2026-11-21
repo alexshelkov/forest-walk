@@ -1,12 +1,13 @@
 // The debug menu of a dev machine (main.ts attaches it only there): a button in the top right corner that opens
 // a panel of switches over the scene's debug API. Its styles travel with it, so a published page carries none.
+import { MEDIUM, WHY } from './scene/quality.js';
 import type { Scene } from './scene/scene.js';
 
 type Weather = 'auto' | 'clear' | 'fog' | 'rain' | 'storm';
 
 const WEATHERS: Weather[] = ['auto', 'clear', 'fog', 'rain', 'storm'];
 const FLASHES = ['patch', 'sheet', 'bolt']; // the kinds of scene.debug.flash, in its order
-const LEVELS = ['High', 'Medium', 'Low']; // quality.js: the level is the index
+const LEVELS = ['Low', 'Medium']; // quality.js: the pick is kept as forestLevel
 // a place: a point of the trail and how many points ahead to look (scene.debug.trail)
 const PLACES: [string, number, number][] = [
   ['start', 0, 10],
@@ -41,6 +42,7 @@ const CSS = `
 #debug .row { display: flex; flex-wrap: wrap; gap: 4px; }
 #debug .row button { min-height: 30px; padding: 4px 9px; border-radius: 8px; background: #ffffff1f; }
 #debug .row button[aria-pressed='true'] { background: #ffc24a; color: #120a05; }
+#debug .note { margin: 6px 0 0; font-weight: 400; opacity: 0.8; }
 #stats { right: 64px; }
 `;
 
@@ -191,26 +193,24 @@ export function attachDebugMenu(
     LEVELS,
     (index) => {
       try {
-        localStorage.setItem('forest', `${index}`);
+        localStorage.setItem('forestLevel', LEVELS[index]);
       } catch {
         return; // storage is blocked: the level cannot be kept, so a reload would change nothing
       }
       location.reload();
     },
-    LEVELS.findIndex((name) => scene.stats().endsWith(name)),
+    MEDIUM ? 1 : 0,
   );
   row('Show', ['stats line'], toggleStats, 1);
-  // (scene.debug.exposure's modes, in its order)
-  const EXPOSURES: [string, 0 | 1 | 2][] = [
-    ['highlights', 0],
-    ['old', 1],
-    ['average', 2],
-  ];
+  const level = document.createElement('p');
+  level.className = 'note';
+  level.textContent = `Running ${MEDIUM ? 'Medium' : 'Low'} (${WHY})`;
+  panel.append(level);
   row(
     'Exposure',
-    EXPOSURES.map((exposure) => exposure[0]),
+    ['highlights', 'old'],
     (index) => {
-      scene.debug.exposure(EXPOSURES[index][1]);
+      scene.debug.exposure(index ? 1 : 0);
     },
     scene.debug.exposure(),
   );

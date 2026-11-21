@@ -1,4 +1,4 @@
-import { LV, NEAR_D, THIN } from './quality.js';
+import { MEDIUM, NEAR_D, THIN } from './quality.js';
 import {
   abs,
   atan2,
@@ -46,6 +46,7 @@ import {
   TDN,
   VS,
 } from './math.js';
+import { farOutline } from './atlas.js';
 import { alongStreams, creekAt } from './water.js';
 
 // ============================================================================
@@ -596,7 +597,12 @@ export function makeWorld(D, T) {
       0,
     );
   const shade = new Float32Array((NX / 2) * (NY / 2) * (NZ / 2)); // light the crowns take, per cell of the light volume
-  const blocks = []; // x, z, radius of what the walker goes round: trunks, boulders, logs, rails
+  const blocks = []; // x, z, radius of what the walker goes round: trunks, boulders, logs, posts
+  // What stops the walker along a line (rails, fences, the unseen edges of crossings and the dock): x0, z0, x1, z1,
+  // radius. A row of discs there was a wall with a bump at each disc, and the walker sliding along it bounced. Their
+  // discs of old stay in `touch`, for the contact map only, so the ground's shading is as it was
+  const walls = [],
+    touch = [];
   // How much of a level line of sight each metre of forest blocks, on a grid of 3 m cells: every trunk, young tree
   // and bush adds its width over its cell's area. scene.js leaves out what stands behind enough of it
   const OCN = 128,
@@ -707,7 +713,21 @@ export function makeWorld(D, T) {
       rt = r0 * (1 - (0.85 * h) / H),
       bx = x + l[0] * h + cos(a) * rt,
       bz = z + l[1] * h + sin(a) * rt;
-    leaf(big, bx, y + h, bz, len, a, tilt, len * 0.62, h, 13, 0.5, hash(7), bend);
+    leaf(
+      big,
+      bx,
+      y + h,
+      bz,
+      len,
+      a,
+      tilt,
+      len * 0.62,
+      h,
+      13,
+      0.5,
+      hash(7),
+      bend,
+    );
     perches.push(bx, y + h, bz, len, a, tilt, bend, 1);
   };
   // the trunk's turn for a lean: tipped that way, spun about itself by chance
@@ -715,8 +735,14 @@ export function makeWorld(D, T) {
     const n = hypot(l[0], 1, l[1]);
     return qMul(qFromY(l[0] / n, 1 / n, l[1] / n), qAxis(0, 1, 0, rnd() * TAU));
   };
+  // A conifer's far pictures' outlines (atlas.js farOutline: 0 fir, 1 broken top, 2 hemlock, 3 cedar, 4 pole), and
+  // for each how far out the boughs reach to fill it: set so the crown seen from 20 m (cards and all) is as wide as
+  // the picture from 58 m, on the mean of its middle eight of ten heights
+  const OUTLINE = [0, 1, 2, 3, 4].map(farOutline),
+    FILL = [1.14, 1.22, 1.26, 1.18, 1.22];
   // A conifer (0 fir, 1 cedar, 6 a thin pole with a small crown at its top): whorls of drooping boughs from h0 up,
-  // each with sprays hanging from it
+  // each with sprays hanging from it. The boughs are drawn first and laid once the far picture is chosen (its kind
+  // last of the tree's draws, as it always was), each reaching to that picture's outline where its tip ends
   const conifer = (x, y, z, kind, H) => {
     const pole = kind === 6,
       hue =
@@ -733,69 +759,90 @@ export function makeWorld(D, T) {
     screen(x, z, r0 * 2.2 + (pole ? 0.15 : 0.5));
     if (r0 > 0.55) trees.push({ x, y, z, r: r0, h: H });
     if (!pole) spots.bough.push([x + l[0] * h0, y + h0, z + l[1] * h0, Lm]);
+    const boughs = [],
+      tops = [];
+    // a bough added to a whorl at h (t of the way up the crown), heading a, by a hash of the tree's place and salt:
+    // the generator's own draws are left as they were, so no tree moves
+    const added = (h, t, a, rt, salt) => {
+      const hs = (k) => ihash(round(x * 20), round(z * 20), salt * 16 + k);
+      boughs.push({
+        h,
+        a,
+        tilt: PI / 2 - 0.1 + 0.4 * hs(0) - 0.55 * t * t,
+        bend: 0.42 + 0.2 * hs(1) - 0.12 * t,
+        rt,
+        f: (0.8 + 0.32 * hs(2)) / 0.96,
+        wide: 0.5 + 0.18 * hs(3),
+        seed: hs(4),
+        spray:
+          hs(5) < 0.65
+            ? {
+                v: 0.45 + 0.45 * hs(6),
+                len: (0.9 + 0.9 * hs(7)) * (kind === 1 ? 1.3 : 1),
+                yaw: a - 0.8 + 1.6 * hs(8),
+                tilt: PI - 0.3 * hs(9),
+                wid: 0.55 + 0.3 * hs(10),
+                seed: hs(11),
+                bend: 0.3 + 0.12 * hs(12),
+              }
+            : null,
+      });
+    };
     let w = 0;
     for (let h = h0; h < H - 0.5; h += rr(1.1, 1.7) * (pole ? 1.2 : 1), w++) {
       const t = (h - h0) / (H - h0),
-        L = (Lm * (1 - 0.86 * pow(t, 0.75)) + 0.45) * rr(0.8, 1.12),
+        f = rr(0.8, 1.12) / 0.96,
         n = pole || t > 0.8 ? 3 : 4 + (rnd() < 0.5),
         rt = r0 * (1 - (0.85 * h) / H);
       for (let j = 0; j < n; j++) {
         const a = ph + w * 2.4 + (j * TAU) / n + rr(-0.3, 0.3),
           tilt = PI / 2 + rr(-0.1, 0.3) - 0.55 * t * t,
-          bend = rr(0.42, 0.62) - 0.12 * t,
-          bx = x + l[0] * h + cos(a) * rt,
-          bz = z + l[1] * h + sin(a) * rt;
-        leaf(
-          big,
-          bx,
-          y + h,
-          bz,
-          L,
+          bend = rr(0.42, 0.62) - 0.12 * t;
+        boughs.push({
+          h,
           a,
           tilt,
-          L * rr(0.5, 0.68),
-          h,
-          kind === 1 ? 10 : 0,
-          hue,
-          rnd(),
           bend,
-        );
-        if (rnd() < 0.65) {
-          const p = onLeaf(bx, y + h, bz, L, a, tilt, bend, rr(0.45, 0.9));
-          leaf(
-            big,
-            p[0],
-            p[1],
-            p[2],
-            rr(0.9, 1.8) * (kind === 1 ? 1.3 : 1),
-            a + rr(-0.8, 0.8),
-            PI - rr(0, 0.3),
-            rr(0.55, 0.85),
-            h,
-            6,
-            hue,
-            rnd(),
-            rr(0.3, 0.42),
-          );
-        }
+          rt,
+          f,
+          wide: rr(0.5, 0.68),
+          seed: rnd(),
+          spray:
+            rnd() < 0.65
+              ? {
+                  v: rr(0.45, 0.9),
+                  len: rr(0.9, 1.8) * (kind === 1 ? 1.3 : 1),
+                  yaw: a + rr(-0.8, 0.8),
+                  tilt: PI - rr(0, 0.3),
+                  wid: rr(0.55, 0.85),
+                  seed: rnd(),
+                  bend: rr(0.3, 0.42),
+                }
+              : null,
+        });
       }
+      // (a whorl short of six boughs gets more, between its own)
+      for (let j = n; j < 6; j++)
+        added(h, t, ph + w * 2.4 + ((j - n + 0.5) * TAU) / n, rt, w * 8 + j);
+      // (a pole's crown a whorl more between each two, half its mean step on)
+      if (pole && h + 0.84 < H - 0.5)
+        for (let j = 0; j < 3; j++)
+          added(
+            h + 0.84,
+            (h + 0.84 - h0) / (H - h0),
+            ph + (w + 0.5) * 2.4 + (j * TAU) / 3,
+            r0 * (1 - (0.85 * (h + 0.84)) / H),
+            w * 8 + 5 + j,
+          );
     }
     for (let j = 0; j < 3; j++)
-      leaf(
-        big,
-        x + l[0] * H,
-        y + H - 0.8,
-        z + l[1] * H,
+      tops.push([
         rr(0.8, 1.3),
         rnd() * TAU,
         rr(0.1, 0.5),
         rr(0.3, 0.45),
-        H,
-        kind === 1 ? 10 : 0,
-        hue,
         rnd(),
-        0.35,
-      );
+      ]);
     // dead branches below the live crown: bare grey sticks with their twigs (type 13), from over head height up
     if (!pole)
       for (let j = 3 + ((rnd() * 5) | 0); j > 0; j--) {
@@ -822,22 +869,98 @@ export function makeWorld(D, T) {
       pole ? 0.025 : 0.05,
     );
     // its far picture (atlas.js farTree): a fir's, now and then one with a broken top or a hemlock's; a cedar's; a pole's
+    const seed = rnd(),
+      far = pole ? 4 : kind === 1 ? 3 : rnd() < 0.14 ? 1 : rnd() < 0.3 ? 2 : 0,
+      band = H - h0 + 0.8;
     farT[cellOf(x, z)].push(
       x + l[0] * h0,
       y + h0 - 0.5,
       z + l[1] * h0,
-      H - h0 + 0.8,
+      band,
       atan2(l[1], l[0]),
       Math.atan(hypot(l[0], l[1])),
       Lm * 2.3,
       h0,
       12,
       hue,
-      rnd(),
-      ((pole ? 4 : kind === 1 ? 3 : rnd() < 0.14 ? 1 : rnd() < 0.3 ? 2 : 0) +
-        0.5) /
-        8,
+      seed,
+      (far + 0.5) / 8,
     );
+    // its boughs, each out to the picture's outline at its tip (it falls or rises along the bough's curve, as
+    // onLeaf has it), none above where a broken top ends
+    const out = OUTLINE[far],
+      reach = Lm * 2.3 * FILL[far],
+      halfAt = (h) => {
+        const r = round(((h - h0 + 0.5) * 200) / band);
+        return r < 0 || r > 200 ? 0 : out[r] * reach;
+      },
+      type = kind === 1 ? 10 : 0;
+    for (const b of boughs) {
+      if (!(halfAt(b.h) > 0)) continue;
+      const ka = (b.bend - 0.3) * 3.4 || 0.06,
+        across = (sin(b.tilt) * sin(ka) + cos(b.tilt) * (1 - cos(ka))) / ka,
+        up = (cos(b.tilt) * sin(ka) - sin(b.tilt) * (1 - cos(ka))) / ka;
+      let L = 0;
+      for (let k = 0; k < 2; k++)
+        L = max(halfAt(b.h + L * up) - b.rt, 0) / across;
+      L = max(L, 0.4) * b.f;
+      const bx = x + l[0] * b.h + cos(b.a) * b.rt,
+        bz = z + l[1] * b.h + sin(b.a) * b.rt;
+      // (a bough 1.6 times as wide as it once was: its picture's branchlets reach to its edges now)
+      leaf(
+        big,
+        bx,
+        y + b.h,
+        bz,
+        L,
+        b.a,
+        b.tilt,
+        L * b.wide * 1.6,
+        b.h,
+        type,
+        hue,
+        b.seed,
+        b.bend,
+      );
+      const s = b.spray;
+      if (s) {
+        const p = onLeaf(bx, y + b.h, bz, L, b.a, b.tilt, b.bend, s.v);
+        leaf(
+          big,
+          p[0],
+          p[1],
+          p[2],
+          s.len,
+          s.yaw,
+          s.tilt,
+          s.wid,
+          b.h,
+          6,
+          hue,
+          s.seed,
+          s.bend,
+        );
+      }
+    }
+    // (a broken top's at the break: its picture's top, 1.5 of its 2)
+    const ht = far === 1 ? min(H - 0.8, h0 - 0.5 + band * 0.75) : H - 0.8,
+      hx = far === 1 ? ht : H;
+    for (const [len, yaw, tilt, wid, s2] of tops)
+      leaf(
+        big,
+        x + l[0] * hx,
+        y + ht,
+        z + l[1] * hx,
+        len,
+        yaw,
+        tilt,
+        wid,
+        H,
+        type,
+        hue,
+        s2,
+        0.35,
+      );
   };
   // A broadleaf (2 maple, 3 birch, 4 oak). Limbs reach from the top of its bole into the crown, each a bare strip
   // (type 8), and the leaf cards sit along the outer part of each limb, heading on outward: a crown is clumps of
@@ -1349,7 +1472,7 @@ export function makeWorld(D, T) {
         rr(0.22, 0.6) * tall,
         rnd() * TAU,
         rr(0.05, 0.6),
-        rr(0.035, 0.06) * (LV > 1 ? 1.5 : 1),
+        rr(0.035, 0.06) * (MEDIUM ? 1 : 1.5),
         0,
         4,
         rnd(),
@@ -1359,7 +1482,7 @@ export function makeWorld(D, T) {
   };
   // (half as many tufts on Low, of wider blades: a meadow in view is otherwise the most triangles of any place)
   for (const p of [MEADOW, ...GLADES])
-    for (let i = p[2] * p[2] * PI * (LV > 1 ? 7 : 14); i > 0; i--) {
+    for (let i = p[2] * p[2] * PI * (MEDIUM ? 14 : 7); i > 0; i--) {
       const a = rnd() * TAU,
         r = sqrt(rnd()) * p[2],
         x = p[0] + cos(a) * r,
@@ -1495,7 +1618,7 @@ export function makeWorld(D, T) {
       q = qRand(),
       sd = rnd();
     if (y > -0.5 && kept())
-      chunk(6, x, y - sc * 0.25, z, sc, q, 1, sd, LV > 1 ? 12 : LV ? 24 : 30);
+      chunk(6, x, y - sc * 0.25, z, sc, q, 1, sd, MEDIUM ? 24 : 12);
   }; // (they shrink away by where scene.js stops drawing them: PEBBLE)
   const shrooms = (x, z, n, R) => {
     const sd = rnd();
@@ -1513,7 +1636,7 @@ export function makeWorld(D, T) {
           qAxis(rr(-0.2, 0.2), 1, rr(-0.2, 0.2), rnd() * TAU),
           4,
           sd + rr(-0.004, 0.004),
-          LV > 1 ? 48 : 96,
+          MEDIUM ? 96 : 48,
         );
     }
   };
@@ -1740,7 +1863,7 @@ export function makeWorld(D, T) {
       q,
       1,
       rnd(),
-      large ? 0 : LV > 1 ? 48 : 96,
+      large ? 0 : MEDIUM ? 96 : 48,
     );
   }
   rseed(11); // pebbles: the trail's gravel, the creek's bed
@@ -1817,7 +1940,7 @@ export function makeWorld(D, T) {
           qRand(),
           1,
           rnd(),
-          LV > 1 ? 48 : 96,
+          MEDIUM ? 96 : 48,
         );
     };
     for (let j = steep > 0.12 ? 2 : 1; j > 0; j--)
@@ -1895,7 +2018,7 @@ export function makeWorld(D, T) {
             turn,
             1,
             own(),
-            LV > 1 ? 48 : 96,
+            MEDIUM ? 96 : 48,
           );
           foam[at] = much;
         }
@@ -1953,7 +2076,7 @@ export function makeWorld(D, T) {
             qRand(),
             1,
             rnd(),
-            LV > 1 ? 48 : 96,
+            MEDIUM ? 96 : 48,
           );
         }
     }
@@ -2122,7 +2245,7 @@ export function makeWorld(D, T) {
   ])
     mantas.push(...m);
   // random vec4s for the dust, the rain and the falling leaves (W_SPR)
-  const snow = new Float32Array((LV > 1 ? 3500 : 7000) * 4);
+  const snow = new Float32Array((MEDIUM ? 7000 : 3500) * 4);
   for (let i = 0; i < snow.length; i++) snow[i] = rnd();
 
   // --- pack leaves (36 bytes: 8 floats + 4 unorm8), sorted by culling cell
@@ -2382,7 +2505,7 @@ export function makeWorld(D, T) {
   const rail = (a, b, w = 0.09, h = 0.12, up = UPY) => {
     beam([a, b], w, h, up);
     for (const t of [0.25, 0.5, 0.75])
-      blocks.push(mix(a[0], b[0], t), mix(a[2], b[2], t), 0.2);
+      touch.push(mix(a[0], b[0], t), mix(a[2], b[2], t), 0.2);
   };
   // What is walked on along `pts` (x, y, z), `half` to each side, into the height map: the walker steps onto it.
   // (No narrower than 0.8 m: the map's cells are 0.75 m, and a narrower strip would be read between it and the bed)
@@ -2535,16 +2658,22 @@ export function makeWorld(D, T) {
             0.09,
           );
           // (what stops the walker: along the rail, not across an opening)
-          for (const j of run)
+          for (const j of run) {
             for (const t of j < to ? [0, 0.5] : [0]) {
               const q = pts[min(j + 1, pts.length - 1)],
                 w = edge[j];
-              blocks.push(
+              touch.push(
                 mix(pts[j][0], q[0], t) + w[0] * side,
                 mix(pts[j][2], q[2], t) + w[1] * side,
                 0.2,
               );
             }
+            if (j < e) {
+              const a = at(j, 0),
+                b = at(j + 1, 0);
+              walls.push(a[0], a[2], b[0], b[2], 0.2);
+            }
+          }
           if (e === to && (e - from) % 3)
             post(...at(e, 0), 1 + rr(-0.03, 0.04), 0.11);
         }
@@ -2635,7 +2764,7 @@ export function makeWorld(D, T) {
           make === 2 ? rr(0.075, 0.095) : rr(0.035, 0.05),
         );
         for (const t of [0.25, 0.5, 0.75])
-          blocks.push(mix(a[0], b[0], t), mix(a[2], b[2], t), 0.2);
+          touch.push(mix(a[0], b[0], t), mix(a[2], b[2], t), 0.2);
       }
     };
     for (let k = 1; k < N - 2; k += 2 + ((rnd() * 3) | 0)) {
@@ -2664,6 +2793,7 @@ export function makeWorld(D, T) {
           y = gy(x, z);
         blocks.push(x, z, 0.25);
         spots.fence.push([x, y, z, make]);
+        if (prev) walls.push(prev[0], prev[2], x, z, 0.2);
         if (prev)
           for (let j = 0; j < 4; j++) {
             const lift = (j + (zig > 0 ? 0.5 : 0)) * 0.2 + 0.07,
@@ -2725,11 +2855,13 @@ export function makeWorld(D, T) {
             al = rr(-0.6, 0.6),
             bx = x + n[0] * side * out - n[1] * al,
             bz = z + n[1] * side * out + n[0] * al;
-          if (rnd() < 0.75)
+          if (rnd() < 0.75) {
             span(
               [prev[0], prev[1] + rh * prev[3], prev[2]],
               [bx, gy(bx, bz) + 0.07, bz],
             );
+            walls.push(prev[0], prev[2], bx, bz, 0.2);
+          }
         }
         prev = null;
         continue;
@@ -2742,6 +2874,7 @@ export function makeWorld(D, T) {
       spots.fence.push([x, y, z, make]);
       const gap = stump || rnd() < 0.1; // a length gone: the next post starts afresh
       if (prev && !gap) {
+        let railed = false;
         for (const rh of heights) {
           if (rnd() < 0.06) continue; // this rail is gone
           const drop = make === 0 && rnd() < 0.05 ? rr(0.2, rh * 0.8) : 0; // a board with one end fallen toward the ground
@@ -2749,7 +2882,10 @@ export function makeWorld(D, T) {
             [prev[0], prev[1] + rh * prev[3] + rr(-0.03, 0.03), prev[2]],
             [tx, y + rh * (h / postH) - drop + rr(-0.03, 0.03), tz],
           );
+          railed = true;
         }
+        // (the walker is stopped from post foot to post foot, so a leaning post makes no bump)
+        if (railed) walls.push(prev[4], prev[5], x, z, 0.2);
         if (make === 0 && rnd() < 0.12)
           rail(
             [prev[0], prev[1] + 0.3, prev[2]],
@@ -2758,11 +2894,11 @@ export function makeWorld(D, T) {
             0.12,
           ); // a brace
       }
-      prev = gap ? null : [tx, y, tz, h / postH];
+      prev = gap ? null : [tx, y, tz, h / postH, x, z];
     }
   }
   // What crosses the water at each crossing, by its make. All are stamped into the height map; the ones without a
-  // rail on a side get a row of unseen stops there instead (blocks), so the walker keeps to them
+  // rail on a side get an unseen stop along it instead (walls), so the walker keeps to them
   // the line's two ends on the banks and the way across; y: the ground at each end
   for (const c of crossings) {
     const { line, lv, make } = c,
@@ -2774,10 +2910,19 @@ export function makeWorld(D, T) {
       len = hypot(b[0] - a[0], b[1] - a[1]),
       dx = (b[0] - a[0]) / len,
       dz = (b[1] - a[1]) / len;
-    // stops along a side of the straight way across, `off` metres out
+    // a stop along a side of the straight way across, `off` metres out
     const stops = (off) => {
-      for (let s = 0.3; s < len - 0.2; s += 0.45)
-        blocks.push(a[0] + dx * s - dz * off, a[1] + dz * s + dx * off, 0.22);
+      let s = 0.3;
+      for (; s < len - 0.2; s += 0.45)
+        touch.push(a[0] + dx * s - dz * off, a[1] + dz * s + dx * off, 0.22);
+      s -= 0.45;
+      walls.push(
+        a[0] + dx * 0.3 - dz * off,
+        a[1] + dz * 0.3 + dx * off,
+        a[0] + dx * s - dz * off,
+        a[1] + dz * s + dx * off,
+        0.22,
+      );
     };
     if (make < 2) {
       // planks on beams with rails, a little arched, the deck never less than two hands over the water; posts
@@ -2817,12 +2962,16 @@ export function makeWorld(D, T) {
           mix(A[1], B[1], s / span) + h,
           A[2] + dz * s + dx * off,
         ];
-      // unseen stops along a side, `off` metres out, for the length of the timber
+      // an unseen stop along a side, `off` metres out, for the length of the timber
       const edge = (off) => {
-        for (let s = -0.1; s < span + 0.2; s += 0.45) {
+        let s = -0.1;
+        for (; s < span + 0.2; s += 0.45) {
           const p = along(s, off, 0);
-          blocks.push(p[0], p[2], 0.22);
+          touch.push(p[0], p[2], 0.22);
         }
+        const p = along(-0.1, off, 0),
+          q = along(s - 0.45, off, 0);
+        walls.push(p[0], p[2], q[0], q[2], 0.22);
       };
       let top = 0.2,
         wide = 0.3;
@@ -2876,6 +3025,8 @@ export function makeWorld(D, T) {
         edge(-side * (wide + 0.26));
       }
       stamp([along(-0.15, 0, top), along(span + 0.15, 0, top)], 0.8);
+      // (the line walked along, bank to bank, and how far the timber reaches to each side of it: scene.js lanes)
+      c.walk = [A[0], A[2], B[0], B[2], wide];
     } else {
       // Stepping stones: five to seven, flat-topped, a stride apart and not in a line, pale and dry on top and
       // clearly proud of the water where each stands (the level steps down at a fall, and the stones with it).
@@ -2906,6 +3057,7 @@ export function makeWorld(D, T) {
       way.push([b[0], yb, b[1]]);
       stamp(way, 0.8);
       for (const side of [-1, 1]) stops(side * 0.72);
+      c.walk = [a[0], a[1], b[0], b[1], 0];
     }
     c.ends = [a[0], a[1], b[0], b[1]];
   }
@@ -2984,12 +3136,18 @@ export function makeWorld(D, T) {
     for (let along = 0; along <= 11.3; along += 0.5)
       for (const side of [-1, 1]) {
         const p = off(along, side * 0.8, 0);
-        blocks.push(p[0], p[2], 0.2);
+        touch.push(p[0], p[2], 0.2);
       }
     for (const across of [-0.4, 0, 0.4]) {
       const p = off(11.3, across, 0);
-      blocks.push(p[0], p[2], 0.2);
+      touch.push(p[0], p[2], 0.2);
     }
+    for (const [a, b] of [
+      [off(0, -0.8, 0), off(11, -0.8, 0)],
+      [off(0, 0.8, 0), off(11, 0.8, 0)],
+      [off(11.3, -0.4, 0), off(11.3, 0.4, 0)],
+    ])
+      walls.push(a[0], a[2], b[0], b[2], 0.2);
     pier.push(mx, mz, ex, ez);
     for (let j = 1; j <= 3; j++)
       for (const side of [-1, 1])
@@ -3441,14 +3599,16 @@ export function makeWorld(D, T) {
     return [x, y + h, z];
   });
   // The contact map (tC in the shaders): how close something stands on the ground, 1024 cells a side over the
-  // world, a soft disc for each of the blocks the walker goes round (trunks, posts, logs, stones, bushes)
+  // world, a soft disc for each of the blocks the walker goes round (trunks, posts, logs, stones, bushes) and of
+  // `touch` (each disc keeps the darker of what falls on it, so the order does not matter)
   const CMN = 1024,
-    cm = new Uint8Array(CMN * CMN);
-  for (let i = 0; i < blocks.length; i += 3) {
-    const cx = ((blocks[i] - OX) / W) * CMN,
-      cz = ((blocks[i + 1] - OZ) / W) * CMN,
-      r0 = blocks[i + 2] * 0.8,
-      r1 = blocks[i + 2] + 0.45,
+    cm = new Uint8Array(CMN * CMN),
+    discs = [...blocks, ...touch];
+  for (let i = 0; i < discs.length; i += 3) {
+    const cx = ((discs[i] - OX) / W) * CMN,
+      cz = ((discs[i + 1] - OZ) / W) * CMN,
+      r0 = discs[i + 2] * 0.8,
+      r1 = discs[i + 2] + 0.45,
       rc = Math.ceil((r1 / W) * CMN);
     for (let j = max(floor(cz) - rc, 0); j <= min(floor(cz) + rc, CMN - 1); j++)
       for (
@@ -3483,13 +3643,19 @@ export function makeWorld(D, T) {
     woodAt,
     bridges: crossings.filter((c) => c.k >= 0).map((c) => c.k),
     // every crossing: its make, the water's half width, where its way across begins and ends (x, z each)
-    crossings: crossings.map((c) => [c.make, c.hw, ...c.ends]),
+    crossings: crossings.map((c) => [
+      c.make,
+      c.hw,
+      ...c.ends,
+      ...(c.walk || []),
+    ]),
     glints: packG(),
     chunks: chunks.map((c) => packC(c)),
     props: props.map((c) => packC(c, (sc) => sc + 1)),
     boulders: boulders.map((b) => packC(b, (sc) => sc * 1.5 + 1)),
     schools,
     blocks,
+    walls,
     trees,
     snags,
     ravenSnags,
@@ -3519,7 +3685,7 @@ export function makeWorld(D, T) {
 // ---------------------------------------------------------------- procedural meshes
 // a rock: an icosphere pushed about by noise and cut by four random planes
 export function meshChunk(sd, sub = 2, det = sub > 2) {
-  if (LV > 1 && sub > 1) sub--; // Low: a quarter of the triangles
+  if (!MEDIUM && sub > 1) sub--; // Low: a quarter of the triangles
   rseed(100 + sd);
   // Nine planes, most cutting deep, on a lump only a little uneven: broken faces that meet at edges. And every
   // triangle gets its own corners, so each face is lit as a face (a few triangles shaded round read as a lump)
@@ -3591,7 +3757,7 @@ export function meshTrunk(kind) {
   rseed(300 + kind);
   const pole = kind === 6,
     m = new Mesh(),
-    sides = pole ? 5 : LV > 1 ? 6 : 8,
+    sides = pole ? 5 : MEDIUM ? 8 : 6,
     bark = () => 1,
     r0 = [0.021, 0.03, 0.022, 0.016, 0.026, 0.05, 0.011][kind];
   if (kind < 2 || kind > 4) {
@@ -3675,7 +3841,7 @@ export function meshTrunk(kind) {
 // (lod: 0 near, 1 mid, 2 far)
 export function meshLog(lod = 0) {
   rseed(77);
-  if (LV > 1 && !lod) lod = 1; // (Low: the middle mesh from the start, so a log never changes close by)
+  if (!MEDIUM && !lod) lod = 1; // (Low: the middle mesh from the start, so a log never changes close by)
   const m = new Mesh(),
     sides = [10, 8, 4][lod],
     n = [12, 8, 1][lod],
@@ -3831,7 +3997,7 @@ export function meshStick(far = false) {
 // A stump with root flares, about 1 wide and 0.8 tall, snapped: its rim stands in splinters of uneven height (by
 // the angle, so every level of detail has the same outline) round a hollow, pale wood at aux 0.24, dark at 0
 export function meshStump(lod = 0) {
-  const seg = [10, LV > 1 ? 10 : 7, 5][lod],
+  const seg = [10, MEDIUM ? 7 : 10, 5][lod],
     m = meshLathe(
       [
         [0.66, 0, 0.6],
