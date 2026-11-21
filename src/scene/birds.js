@@ -96,16 +96,18 @@ const SPECIES = [
     ruffles: 0.05, // or to fluff its feathers and shake
   },
   {
-    // (1.2 times life: a common raven of 0.6 m)
+    // (1.2 times life: a common raven of 0.6 m; its mesh 0.98 of its length from bill tip to tail tip)
     name: 'raven',
     rest: 0.65,
     restGround: 0.38,
     shape: 2,
-    len: 0.72,
+    len: 0.73,
     notice: 16,
     leave: 9, // (about 9 m: its boldness spreads it from 7.4 to 10.6)
     speed: 10,
     beat: 3.5,
+    beatUp: 1.1, // (its beats off the perch and to land, against its own: deep and slow still)
+    beatDown: 1.3,
     wing: 'glide',
     glide: 0.35, // the wingbeat's phase it glides at (vsJay's Form: the arms a little raised, the hands level)
     bursts: [1, 2.4, 0.9, 1.7], // seconds of glide, then of beating (each from, to)
@@ -130,8 +132,26 @@ export const JAYS = 6,
   FIRST_JAY_AT = 20,
   CROSSING_EVERY = 105,
   CROSSING_LEAST = 40;
-// the ravens, two at most; not yet in the world: only held for stills (debug bird()), drawn only while held
-export const RAVENS = 2;
+// The ravens: a pair, each at home by two snags in the open (the meadow's edge, the lake's shore), and kept where a
+// walker's eye is: on low perches beside the path near them (rail, fence and sign posts; the high snags only a
+// refuge) and on the path itself. RAVEN_REACH: metres from its snags such a perch or a walk may lie
+export const RAVENS = 2,
+  RAVEN_REACH = 26;
+// AWAY_LEG: metres of each further leg a raven flies on while still seen when its way out of sight ends; AWAY_LEGS:
+// at most so many
+const AWAY_LEG = 25,
+  AWAY_LEGS = 6,
+  OPEN_SKY = 40, // a place has open sky over it where less crown than this lies straight up (scene.js veil)
+  // PATH_LEAVE: how near a walker who keeps to the path may come before a raven goes (off the path, the species'
+  // leave); DOWN: how often the next thing a raven on a low perch does is to come down and walk the path, the
+  // meadow's and the lake's
+  PATH_LEAVE = 4,
+  DOWN = [0.4, 0.1],
+  RAIL_TOP = 2, // metres over the ground above which a raven on the wing minds no rail (clearWay)
+  // a flyover counts a place seen inside a level view's frame: across and up from the eye, as tangents (a little
+  // inside scene.js TANW and TANH0)
+  FRAME_W = 0.45,
+  FRAME_UP = 0.5;
 const MOST = 24; // the most birds there may be at once: the instance buffers are made once
 const STRIDE = 0.2; // a raven's step, in its lengths (vsJay's Form.stride)
 const NEAR = 9; // metres: beyond it the far mesh
@@ -378,7 +398,9 @@ function meshCorvid(form, far) {
   // A loft of rings, each z, its middle over the axis, its half width, its reach up and its reach down, closed at
   // both ends (by `ends`: how far past the first and the last ring)
   const loft = (all, sides, ends) => {
-    const rings = far ? all.filter((_, k) => k % 2 === 0 || k === all.length - 1) : all,
+    const rings = far
+        ? all.filter((_, k) => k % 2 === 0 || k === all.length - 1)
+        : all,
       rows = rings.map(([z, y, wide, up, down]) =>
         Array.from({ length: sides }, (_, s) => {
           const a = (s / sides) * TAU;
@@ -445,18 +467,30 @@ function meshCorvid(form, far) {
     }
   // The raven's hackles: narrow pointed feathers hanging from the throat in rows, splayed a little, shaggy
   if (form.hackles) {
-    // (each row on the throat's surface: z, its middle over the axis, its half width, its reach down)
-    const { rows: rowsAt, n, len, half, way: hang } = form.hackles;
-    for (const [z, y, wide, down] of far ? rowsAt.slice(1, 2) : rowsAt)
+    // (each row on the throat's surface: its middle over the axis, its half width, its reach down, from the body's
+    // rings either side of its z)
+    const { rows: rowsAt, n, len, half, way: hang } = form.hackles,
+      ringAt = (z) => {
+        const k = form.body.findIndex((ring) => ring[0] <= z),
+          [a, b] = [form.body[k - 1], form.body[k]],
+          t = (z - b[0]) / (a[0] - b[0]);
+        return [z, mix(b[1], a[1], t), mix(b[2], a[2], t), mix(b[4], a[4], t)];
+      };
+    for (const [z, y, wide, down] of (far ? rowsAt.slice(1, 2) : rowsAt).map(
+      ringAt,
+    ))
       for (let k = 0; k < (far ? 3 : n); k++) {
         const a = ((far ? k / 2 : k / (n - 1)) - 0.5) * 2.2,
           root = [sin(a) * wide * 0.95, AX + y - cos(a) * down * 0.97, z],
           way = [sin(a) * hang[0], hang[1], hang[2]],
           wl = hypot(...way);
+        // (its vane along the throat's surface there)
+        const across = [cos(a) * wide, sin(a) * down, 0],
+          al = hypot(...across);
         feather(
           root,
           way.map((c) => c / wl),
-          [cos(a), sin(a) * 0.3, 0],
+          across.map((c) => c / al),
           len * (0.85 + 0.3 * ((k * 7) % 3) * 0.5),
           far ? half * 1.6 : half,
           -22,
@@ -484,14 +518,16 @@ function meshCorvid(form, far) {
     const code = (out) => side * (26 + Math.round((out / wing.len) * 101)),
       x = (out) => side * (wing.x + out),
       lead = (far ? wing.farCoverts : wing.coverts).map((out) => [
-          fv(x(out), AX + 0.074, wing.z + 0.004, code(out), 0, -0.3),
-          fv(x(out), AX + 0.072, wing.covert, code(out), 0, -0.1),
-        ]);
+        fv(x(out), AX + 0.074, wing.z + 0.004, code(out), 0, -0.3),
+        fv(x(out), AX + 0.072, wing.covert, code(out), 0, -0.1),
+      ]);
     for (let k = 0; k < lead.length - 1; k++)
       m.quad(lead[k][0], lead[k + 1][0], lead[k + 1][1], lead[k][1]);
     const nArm = far ? arm.farN : arm.n;
     for (let k = 0; k < nArm; k++) {
-      const out = far ? arm.farFirst + k * arm.farStep : arm.first + k * arm.step;
+      const out = far
+        ? arm.farFirst + k * arm.farStep
+        : arm.first + k * arm.step;
       feather(
         [x(out), AX + 0.07 - 0.0012 * k, arm.z],
         [0, 0, -1],
@@ -511,7 +547,8 @@ function meshCorvid(form, far) {
         hand.len + (far ? hand.farGrow : hand.grow) * k,
         far ? hand.farHalf : hand.half,
         code(out),
-        hand.fingers > 0 && k >= nHand - (far ? hand.fingers / 2 : hand.fingers),
+        hand.fingers > 0 &&
+          k >= nHand - (far ? hand.fingers / 2 : hand.fingers),
       );
     }
     // A leg: from under the belly's feathers back to the heel, then the shank forward and down to the foot; three
@@ -520,7 +557,13 @@ function meshCorvid(form, far) {
       foot = [side * leg.foot[0], leg.foot[1], leg.foot[2]],
       hip = [side * leg.hip[0], AX + leg.hip[1], leg.hip[2]],
       heel = [side * leg.heel[0], leg.heel[1], leg.heel[2]];
-    m.tube([hip, heel, foot], (k) => leg.thick[k], far ? 3 : 4, true, () => -14 / 127);
+    m.tube(
+      [hip, heel, foot],
+      (k) => leg.thick[k],
+      far ? 3 : 4,
+      true,
+      () => -14 / 127,
+    );
     // (a raven's thigh, feathered: body, down the first half of the leg)
     if (leg.thigh)
       m.tube(
@@ -602,7 +645,16 @@ const JAY = {
     far: [[0.1, 0.098, 0.094, 0.5, 0.022]],
   },
   crest: true,
-  tail: { root: -0.14, y: 0.03, len: 0.4, short: 0.012, half: 0.03, farHalf: 0.05, drop: 0.0025, keel: 0 },
+  tail: {
+    root: -0.14,
+    y: 0.03,
+    len: 0.4,
+    short: 0.012,
+    half: 0.03,
+    farHalf: 0.05,
+    drop: 0.0025,
+    keel: 0,
+  },
   wing: {
     x: 0.07,
     z: 0.21,
@@ -610,8 +662,32 @@ const JAY = {
     covert: 0.125,
     coverts: [0, 0.09, 0.18, 0.26, 0.31, 0.36],
     farCoverts: [0, 0.18, 0.36],
-    arm: { n: 7, first: 0.03, step: 0.034, farN: 3, farFirst: 0.05, farStep: 0.08, z: 0.16, len: 0.2, half: 0.034, farHalf: 0.06 },
-    hand: { n: 8, first: 0.27, step: 0.0125, farN: 4, farStep: 0.029, z: 0.16, len: 0.2, grow: 0.009, farGrow: 0.02, half: 0.034, farHalf: 0.05, fingers: 0 },
+    arm: {
+      n: 7,
+      first: 0.03,
+      step: 0.034,
+      farN: 3,
+      farFirst: 0.05,
+      farStep: 0.08,
+      z: 0.16,
+      len: 0.2,
+      half: 0.034,
+      farHalf: 0.06,
+    },
+    hand: {
+      n: 8,
+      first: 0.27,
+      step: 0.0125,
+      farN: 4,
+      farStep: 0.029,
+      z: 0.16,
+      len: 0.2,
+      grow: 0.009,
+      farGrow: 0.02,
+      half: 0.034,
+      farHalf: 0.05,
+      fingers: 0,
+    },
   },
   leg: {
     hip: [0.05, -0.055, 0.05],
@@ -628,25 +704,26 @@ const JAY = {
   },
   eye: [0.066, 0.125, 0.365, 0.014],
 };
-// The common raven: a deep bill as long as the head with an arched ridge, a flat crown, shaggy hackles on the throat,
-// a deep chest, a long wedge of a tail as long as the body without the head, long stout legs; the wings two and a
-// half times its length across (the bones 1.18 long, the wrist 0.48 out), the outer six primaries fingers
+// The common raven: a deep bill as long as the head with an arched ridge, a flat crown, a thick neck with shaggy
+// hackles standing out under the bill, a heavy chest and belly, a broad blunt wedge of a tail about as long as the
+// body without the head, stout legs feathered to the heel; the wings one and a half times its length across (the
+// bones 1.18 long, the wrist 0.48 out), the outer six primaries fingers
 const RAVEN = {
-  lift: 0.08,
+  lift: 0.1,
   body: [
     [0.372, 0.101, 0.03, 0.033, 0.03],
     [0.358, 0.105, 0.052, 0.047, 0.046],
-    [0.335, 0.109, 0.066, 0.058, 0.06],
-    [0.305, 0.111, 0.074, 0.062, 0.072],
-    [0.275, 0.104, 0.082, 0.066, 0.09],
-    [0.24, 0.088, 0.094, 0.072, 0.115],
-    [0.2, 0.068, 0.106, 0.082, 0.14],
-    [0.15, 0.045, 0.118, 0.095, 0.172],
-    [0.085, 0.028, 0.124, 0.102, 0.19],
-    [0.015, 0.018, 0.12, 0.1, 0.178],
-    [-0.045, 0.016, 0.104, 0.09, 0.145],
-    [-0.09, 0.018, 0.08, 0.07, 0.095],
-    [-0.12, 0.024, 0.05, 0.044, 0.048],
+    [0.335, 0.109, 0.068, 0.058, 0.063],
+    [0.305, 0.111, 0.078, 0.063, 0.079],
+    [0.275, 0.104, 0.09, 0.068, 0.108],
+    [0.24, 0.088, 0.102, 0.075, 0.136],
+    [0.2, 0.068, 0.114, 0.085, 0.163],
+    [0.15, 0.045, 0.124, 0.098, 0.205],
+    [0.085, 0.028, 0.13, 0.105, 0.238],
+    [0.015, 0.018, 0.126, 0.103, 0.222],
+    [-0.045, 0.016, 0.108, 0.092, 0.181],
+    [-0.09, 0.018, 0.082, 0.071, 0.114],
+    [-0.12, 0.024, 0.052, 0.045, 0.053],
   ],
   bill: {
     rings: [
@@ -659,19 +736,22 @@ const RAVEN = {
     ],
   },
   hackles: {
-    rows: [
-      [0.34, 0.108, 0.062, 0.057],
-      [0.305, 0.111, 0.074, 0.072],
-      [0.275, 0.104, 0.082, 0.09],
-      [0.24, 0.088, 0.094, 0.115],
-      [0.2, 0.068, 0.106, 0.14],
-    ],
+    rows: [0.352, 0.325, 0.295, 0.262, 0.225], // (each z: a row round the throat, on the body's surface there)
     n: 7,
     len: 0.1,
-    half: 0.012,
-    way: [0.5, -0.8, -0.38],
+    half: 0.02,
+    way: [0.35, -0.75, -0.45],
   },
-  tail: { root: -0.12, y: 0.03, len: 0.3, short: 0.01, half: 0.042, farHalf: 0.07, drop: 0.006, keel: 0.07 },
+  tail: {
+    root: -0.12,
+    y: 0.03,
+    len: 0.36,
+    short: 0.008,
+    half: 0.058,
+    farHalf: 0.088,
+    drop: 0.009,
+    keel: 0.1,
+  },
   wing: {
     x: 0.07,
     z: 0.19,
@@ -679,22 +759,46 @@ const RAVEN = {
     covert: 0.09,
     coverts: [0, 0.12, 0.24, 0.36, 0.46, 0.56, 0.66],
     farCoverts: [0, 0.24, 0.46, 0.66],
-    arm: { n: 11, first: 0.03, step: 0.04, farN: 4, farFirst: 0.05, farStep: 0.13, z: 0.13, len: 0.27, half: 0.03, farHalf: 0.07 },
-    hand: { n: 10, first: 0.48, step: 0.02, farN: 5, farStep: 0.045, z: 0.13, len: 0.27, grow: 0.028, farGrow: 0.06, half: 0.032, farHalf: 0.05, fingers: 6 },
+    arm: {
+      n: 11,
+      first: 0.03,
+      step: 0.04,
+      farN: 4,
+      farFirst: 0.05,
+      farStep: 0.13,
+      z: 0.13,
+      len: 0.27,
+      half: 0.03,
+      farHalf: 0.07,
+    },
+    hand: {
+      n: 10,
+      first: 0.48,
+      step: 0.02,
+      farN: 5,
+      farStep: 0.045,
+      z: 0.13,
+      len: 0.27,
+      grow: 0.028,
+      farGrow: 0.06,
+      half: 0.032,
+      farHalf: 0.05,
+      fingers: 6,
+    },
   },
   leg: {
     hip: [0.055, -0.06, 0.045],
     heel: [0.066, 0.12, -0.05],
     foot: [0.065, 0.012, 0],
-    thick: [0.034, 0.02, 0.018],
-    thigh: [0.055, 0.05, 0.026], // (feathered: the belly's feathers down over the top of the leg)
+    thick: [0.04, 0.026, 0.023],
+    thigh: [0.072, 0.066, 0.042], // (feathered: the belly's feathers down over the top of the leg)
     toes: [
       [-0.45, 0.12],
       [0, 0.13],
       [0.45, 0.11],
       [PI, 0.09],
     ],
-    toeThick: [0.015, 0.011, 0.004],
+    toeThick: [0.018, 0.013, 0.005],
   },
   eye: [0.058, 0.124, 0.338, 0.013],
 };
@@ -740,6 +844,7 @@ const turnTo = (a, b) => {
 export function makeBirds({
   ground,
   avoid,
+  standing, // standing(x, z, pad): is a trunk, boulder, log or post within pad of a place (rails not counted)?
   dry,
   perches,
   tops,
@@ -749,16 +854,18 @@ export function makeBirds({
   paths, // every path as its points (x, z) a metre apart, the loop first: what a jay crosses
   pale, // pale(x, z): is the ground there a path's (a bird seen against it stands out)?
   ravenTops, // where the ravens stand on their snags (x, y z each): the first two the meadow's, then the lake's
+  ravenLows, // the ravens' low perches (x, y z each): post tops a metre to three high beside a path
   openGround, // openGround(x, z): may a raven walk there (the meadow's grass, the shore, a path)?
   veil, // veil(x, y, z, dx, dy, dz, far): how much crown lies along a ray (scene.js; under 30 the sky shows clear)
 }) {
   let groups = []; // who lives where (homes(n), scene.js): populate fills it
   const birds = [],
     nBranch = perches.length / 8,
-    // (the branches first, then the tops of posts, then the ravens' snags: theirs alone)
-    allTops = [...tops, ...ravenTops.flat()],
+    // (the branches first, then the tops of posts, then the ravens' snags and low perches: theirs alone)
+    allTops = [...tops, ...ravenTops.flat(), ...ravenLows.flat()],
     nShared = nBranch + tops.length / 3,
-    nPerch = nShared + ravenTops.length,
+    nLow = nShared + ravenTops.length,
+    nPerch = nLow + ravenLows.length,
     taken = new Array(nPerch).fill(null);
   let ravenCount = RAVENS;
   let on = true,
@@ -919,6 +1026,27 @@ export function makeBirds({
       yaw: stickYaw(k) + (chance() < 0.5 ? 1 : -1) * between(1.1, 2),
     });
   };
+  // a raven on a low perch stands across the path, so a walker coming along it sees it side on
+  const acrossPath = (x, z) => {
+    let best = 1e9,
+      j = 0;
+    const loop = paths[0];
+    loop.forEach((p, i) => {
+      const d = hypot(p[0] - x, p[1] - z);
+      if (d < best) [best, j] = [d, i];
+    });
+    const a = loop[max(j - 2, 0)],
+      b = loop[min(j + 2, loop.length - 1)];
+    return (
+      atan2(b[1] - a[1], b[0] - a[0]) +
+      (chance() < 0.5 ? PI / 2 : -PI / 2) +
+      between(-0.35, 0.35)
+    );
+  };
+  const ravenSits = (bird, k) => {
+    sitOn(bird, k, 0);
+    bird.yaw = k < nLow ? chance() * TAU : acrossPath(bird.x, bird.z);
+  };
   // populate(n): the world's birds afresh, n of them
   let jayCount = 0;
   const populate = (n) => {
@@ -926,17 +1054,40 @@ export function makeBirds({
     birds.length = 0;
     taken.fill(null);
     groups = homes(min(n, MOST - RAVENS));
-    // (a raven to each home: the meadow's two snags, the lake's two; it walks about on open ground near them)
-    for (let r = 0; r < min(ravenCount, ravenTops.length / 2); r++) {
-      const snags = [nShared + 2 * r, nShared + 2 * r + 1];
+    // (a raven to each home: the meadow's two snags, the lake's two, with the low perches nearer them than the
+    // other home's)
+    const nHome = ravenTops.length / 2,
+      near = (k, r) =>
+        min(
+          ...[0, 1].map((j) =>
+            hypot(
+              seat[k * 4] - ravenTops[2 * r + j][0],
+              seat[k * 4 + 2] - ravenTops[2 * r + j][2],
+            ),
+          ),
+        );
+    for (let r = 0; r < min(ravenCount, nHome); r++) {
+      const snags = [nShared + 2 * r, nShared + 2 * r + 1],
+        lows = [];
+      for (let k = nLow; k < nPerch; k++)
+        if (
+          near(k, r) < RAVEN_REACH &&
+          Array.from({ length: nHome }, (_, o) => near(k, o)).every(
+            (d, o) => o === r || d > near(k, r),
+          )
+        )
+          lows.push(k);
       groups.push({
         x: (seat[snags[0] * 4] + seat[snags[1] * 4]) / 2,
         z: (seat[snags[0] * 4 + 2] + seat[snags[1] * 4 + 2]) / 2,
-        r: 22,
+        r: RAVEN_REACH,
         n: 1,
         species: SPECIES.findIndex((kind) => kind.name === 'raven'),
         lives: 'raven',
+        home: r,
         snags,
+        lows,
+        walks: null, // (ravenSpot finds them when first asked)
       });
     }
     groups.forEach((group, g) => {
@@ -948,8 +1099,8 @@ export function makeBirds({
       for (let k = 0; k < group.n; k++) {
         const bird = fresh(g, kind);
         if (group.lives === 'raven') {
-          sitOn(bird, group.snags[0], 0);
-          bird.yaw = chance() * TAU;
+          const low = group.lows[floor(chance() * group.lows.length)];
+          ravenSits(bird, low ?? group.snags[0]);
           birds.push(bird);
           continue;
         }
@@ -997,16 +1148,21 @@ export function makeBirds({
   };
   const P = [0, 0, 0],
     Q = [0, 0, 0];
-  const clearWay = (c, walker, fromAir) => {
+  const clearWay = (c, walker, fromAir, raven) => {
     // (a place every 1.2 m of the way; near either end a trunk may be close: the perch is a branch of it. One
-    // brought in on the wing has no tree at its start. The walker is kept clear of from head to foot)
+    // brought in on the wing has no tree at its start. The walker is kept clear of from head to foot. A raven over
+    // RAIL_TOP minds no rail: its low perches stand by them)
     const far = hypot(c[9] - c[0], c[11] - c[2]),
       n = max(8, Math.ceil(far / 1.2));
     for (let k = 1; k < n; k++) {
       curveAt(c, k / n, P);
       const p = avoid(P[0], P[2], 0.1),
-        fromEnd = (min(fromAir ? n : k, n - k) * far) / n;
-      if (hypot(p[0] - P[0], p[1] - P[2]) > 0.02 && fromEnd > 1.5) return false;
+        fromEnd = (min(fromAir ? n : k, n - k) * far) / n,
+        blocked =
+          raven && P[1] > ground(P[0], P[2]) + RAIL_TOP
+            ? standing(P[0], P[2], 0.1)
+            : hypot(p[0] - P[0], p[1] - P[2]) > 0.02;
+      if (blocked && fromEnd > 1.5) return false;
       if (P[1] < ground(P[0], P[2]) + 0.12) return false;
       if (hypot(P[0] - walker.x, P[2] - walker.z) < 1 && P[1] < walker.y + 1)
         return false;
@@ -1052,10 +1208,19 @@ export function makeBirds({
           for (let k = 0; k < 3; k++)
             c[3 + k] = c[6 + k] =
               (8 * crossing.via[k] - c[k] - c[9 + k]) / 6 +
-              (k === 1 ? abs(bow) * 0.2 + lift : k === 0 ? -uz * bow : ux * bow);
+              (k === 1
+                ? abs(bow) * 0.2 + lift
+                : k === 0
+                  ? -uz * bow
+                  : ux * bow);
         if (
           (!crossing || crossing.fits(c, T)) &&
-          clearWay(c, walker, crossing && crossing.fromAir)
+          clearWay(
+            c,
+            walker,
+            crossing && crossing.fromAir,
+            bird.kind.name === 'raven',
+          )
         ) {
           curve = c;
           break;
@@ -1298,7 +1463,7 @@ export function makeBirds({
     }
     headAndTail(bird, h, walker, near);
   };
-  const onWing = (bird, h) => {
+  const onWing = (bird, h, walker) => {
     const kind = bird.kind,
       flight = bird.flight,
       c = flight.curve;
@@ -1320,7 +1485,8 @@ export function makeBirds({
     const t = clamp(flight.t, 0, flight.T), // (under 0: it waits at its way's start, out of sight)
       s = t / flight.T,
       up = flight.cruise ? 0 : min(0.3, flight.T / 3),
-      down = min(0.45, flight.T / 3),
+      // (a raven going away keeps its pace to the end: it flies on, or is out of sight)
+      down = flight.perch === -2 ? 0 : min(0.45, flight.T / 3),
       pace = 1 / (flight.T - (up + down) / 2),
       e =
         t < up
@@ -1336,7 +1502,7 @@ export function makeBirds({
       level = hypot(tx, tz);
     // the last seventh of the way it flares: nose up, wings and tail wide, beating twice as fast, legs reaching
     // forward for the perch
-    const flare = clamp((s - 0.84) / 0.12, 0, 1),
+    const flare = flight.perch === -2 ? 0 : clamp((s - 0.84) / 0.12, 0, 1),
       first = flight.t < 0.3;
     bird.x = P[0];
     bird.y = P[1];
@@ -1371,7 +1537,11 @@ export function makeBirds({
       ((beating || glides ? 1 : 0) - bird.spread) *
       min(1, h / (first ? 0.07 : 0.035));
     if (beating)
-      bird.phase += TAU * kind.beat * (first ? 1.5 : flare > 0 ? 2 : 1) * h;
+      bird.phase +=
+        TAU *
+        kind.beat *
+        (first ? (kind.beatUp ?? 1.5) : flare > 0 ? (kind.beatDown ?? 2) : 1) *
+        h;
     // (gliding, the wings come level and stay there)
     else if (glides)
       bird.phase += turnTo(bird.phase, kind.glide ?? -0.15) * min(1, h / 0.1);
@@ -1382,7 +1552,10 @@ export function makeBirds({
     bird.head *= 1 - min(1, h / 0.1);
     bird.cock *= 1 - min(1, h / 0.1);
     if (s >= 1 && flight.perch === -2) {
-      // (a raven gone over or away: out of sight now, it is back at a snag of its own once unseen)
+      // (a raven gone over or away: still seen, it flies on the way it goes; out of sight, it is back at a snag of
+      // its own once unseen)
+      if (walker && seenFrom(walker, bird.x, bird.y, bird.z) && onward(bird))
+        return;
       Object.assign(bird, { mode: 'gone', flight: null, air: 0, spread: 0 });
       bird.next = between(8, 20);
       return;
@@ -1400,9 +1573,11 @@ export function makeBirds({
       bird.comeDown = between(20, 40);
       bird.along = 0.6;
       bird.alongNow = undefined;
-      // (on a branch it sits across it, turned the lesser way; on a post's top as it came)
+      // (on a branch it sits across it, turned the lesser way; on a raven's low perch across the path; on a post's
+      // top as it came)
       bird.yawTo = bird.yaw;
-      if (flight.perch >= 0 && flight.perch < nBranch) {
+      if (flight.perch >= nLow) bird.yawTo = acrossPath(bird.x, bird.z);
+      else if (flight.perch >= 0 && flight.perch < nBranch) {
         const across = stickYaw(flight.perch) + PI / 2,
           off = turnTo(bird.yaw, across);
         bird.yawTo =
@@ -1690,7 +1865,8 @@ export function makeBirds({
         p = along(9);
       if (!p) continue;
       const a = (p[0] - walker.x) * fx + (p[1] - walker.z) * fz,
-        off = abs((p[1] - walker.z) * fx - (p[0] - walker.x) * fz) / max(a, 0.1);
+        off =
+          abs((p[1] - walker.z) * fx - (p[0] - walker.x) * fz) / max(a, 0.1);
       if (a > 0 && off < most) {
         most = off;
         best = along;
@@ -1852,7 +2028,9 @@ export function makeBirds({
     if (!ways.length)
       return [
         null,
-        woods ? 'no perch in view across the path ahead' : 'open ground or water',
+        woods
+          ? 'no perch in view across the path ahead'
+          : 'open ground or water',
       ];
     const took = (bird, k, brought) => {
       const group = groups[bird.group],
@@ -1870,7 +2048,10 @@ export function makeBirds({
         bird.spread = 1;
       }
       lastCross = clock;
-      return [bird, brought ? 'from out of sight in the woods' : 'from its perch'];
+      return [
+        bird,
+        brought ? 'from out of sight in the woods' : 'from its perch',
+      ];
     };
     // from its perch: one sitting still on the other side of the path, not far from where it lands
     for (const { side, fits, k, s } of ways)
@@ -1880,7 +2061,8 @@ export function makeBirds({
           continue;
         if (ahead(bird.x, bird.z) < 3 || bird.y - ground(bird.x, bird.z) > 5.5)
           continue;
-        if (hypot(bird.x - seat[k * 4], bird.z - seat[k * 4 + 2]) > 26) continue;
+        if (hypot(bird.x - seat[k * 4], bird.z - seat[k * 4 + 2]) > 26)
+          continue;
         if (flyTo(bird, feet(bird, k, 0.6), k, walker, { fits: fits(false) }))
           return took(bird, k, false);
       }
@@ -1904,7 +2086,14 @@ export function makeBirds({
         };
       let edge = 2;
       while (edge < 20 && framed(...start(edge), -0.14)) edge += 0.5;
-      for (const wide of [edge, edge + 1, edge + 2.5, edge + 4, edge + 6, edge + 9]) {
+      for (const wide of [
+        edge,
+        edge + 1,
+        edge + 2.5,
+        edge + 4,
+        edge + 6,
+        edge + 9,
+      ]) {
         const [x0, y0, z0] = start(wide),
           at = avoid(x0, z0, 0.4),
           under = ground(at[0], at[1]),
@@ -1932,14 +2121,79 @@ export function makeBirds({
     const fl = hypot(walker.fx, walker.fz) || 1,
       a = ((x - walker.x) * walker.fx + (z - walker.z) * walker.fz) / fl,
       r = ((z - walker.z) * walker.fx - (x - walker.x) * walker.fz) / fl;
-    return a > -1 && abs(r) < 0.7 * a + 2 && hypot(x - walker.x, z - walker.z) < 60;
+    return (
+      a > -1 && abs(r) < 0.7 * a + 2 && hypot(x - walker.x, z - walker.z) < 60
+    );
+  };
+  // and with no crowns between: the sky shows clear along the ray (veil under 30)
+  const seenFrom = (walker, x, y, z) => {
+    if (!inSight(x, z, walker)) return false;
+    const d = hypot(x - walker.x, y - walker.y, z - walker.z) || 1;
+    return (
+      veil(
+        walker.x,
+        walker.y,
+        walker.z,
+        (x - walker.x) / d,
+        (y - walker.y) / d,
+        (z - walker.z) / d,
+        d,
+      ) < 30
+    );
+  };
+  // The next leg of a raven's way out of sight: on along the way it flies, a little higher, turned round a trunk
+  const onward = (bird) => {
+    const flight = bird.flight,
+      fx = cos(bird.yaw),
+      fz = sin(bird.yaw);
+    flight.legs = (flight.legs || 0) + 1;
+    if (flight.legs > AWAY_LEGS) return false;
+    for (const turn of [0, 0.35, -0.35, 0.7, -0.7]) {
+      const x = bird.x + cos(bird.yaw + turn) * AWAY_LEG,
+        z = bird.z + sin(bird.yaw + turn) * AWAY_LEG,
+        y = max(bird.y + 2, ground(x, z) + 10),
+        c = [
+          bird.x,
+          bird.y,
+          bird.z,
+          bird.x + (fx * AWAY_LEG) / 3,
+          bird.y + (y - bird.y) / 3,
+          bird.z + (fz * AWAY_LEG) / 3,
+          x - (cos(bird.yaw + turn) * AWAY_LEG) / 3,
+          y,
+          z - (sin(bird.yaw + turn) * AWAY_LEG) / 3,
+          x,
+          y,
+          z,
+        ];
+      let clear = true;
+      for (let k = 1; k <= AWAY_LEG / 1.5 && clear; k++) {
+        curveAt(c, k / (AWAY_LEG / 1.5), P);
+        const p = avoid(P[0], P[2], 0.2);
+        clear =
+          hypot(p[0] - P[0], p[1] - P[2]) < 0.01 &&
+          P[1] > ground(P[0], P[2]) + 6;
+      }
+      if (!clear) continue;
+      Object.assign(flight, {
+        curve: c,
+        t: 0,
+        T: AWAY_LEG / bird.kind.speed,
+        cruise: true,
+      });
+      return true;
+    }
+    return false;
   };
   // A raven's head turns slowly from one bearing to another, now and then to the walker; its weight shifts
   const ravenHead = (bird, h, walker, near) => {
     bird.headNext -= h;
     if (bird.headNext <= 0) {
       bird.headNext = wait(2.6);
-      const bearing = turnTo(bird.yaw, atan2(walker.z - bird.z, walker.x - bird.x));
+      const bearing = turnTo(
+        bird.yaw,
+        atan2(walker.z - bird.z, walker.x - bird.x),
+      );
       bird.headTo =
         near && abs(bearing) < 1.3 && chance() < 0.4
           ? clamp(bearing / 1.3, -1, 1)
@@ -1961,7 +2215,13 @@ export function makeBirds({
   // A walk of a few strides to a place near: each step STRIDE of its length, the feet planted while down (vsJay);
   // `scale` under 1 for a short shuffle where it stands (`still`: the body stays, on a snag's top)
   const startWalk = (bird, to, scale = 1, still = false) => {
-    bird.walk = { to, scale, still, cyc: between(0.9, 1.1), left: to ? 6 : 0.5 };
+    bird.walk = {
+      to,
+      scale,
+      still,
+      cyc: between(0.9, 1.1),
+      left: to ? 6 : 0.5,
+    };
     bird.step = 0;
     bird.act = 'walk';
     bird.actT = 0;
@@ -1980,13 +2240,21 @@ export function makeBirds({
       const d = hypot(walk.to[0] - bird.x, walk.to[1] - bird.z);
       if (d < 0.25 && !ending) walk.left = min(walk.left, 0.5);
       bird.yaw +=
-        clamp(turnTo(bird.yaw, atan2(walk.to[1] - bird.z, walk.to[0] - bird.x)), -1, 1) * min(1, h * 1.4);
+        clamp(
+          turnTo(bird.yaw, atan2(walk.to[1] - bird.z, walk.to[0] - bird.x)),
+          -1,
+          1,
+        ) * min(1, h * 1.4);
     }
     if (speed > 0) {
       const nx = bird.x + cos(bird.yaw) * speed * h,
         nz = bird.z + sin(bird.yaw) * speed * h,
         p = avoid(nx, nz, 0.15);
-      if (hypot(p[0] - nx, p[1] - nz) > 0.01 || !openGround(nx, nz) || !dry(nx, nz))
+      if (
+        hypot(p[0] - nx, p[1] - nz) > 0.01 ||
+        !openGround(nx, nz) ||
+        !dry(nx, nz)
+      )
         walk.left = min(walk.left, 0.5);
       else {
         bird.x = nx;
@@ -2006,24 +2274,59 @@ export function makeBirds({
       bird.next = wait(1.6);
     }
   };
-  // a place on open ground near it for it to walk to or come down on, within its home's reach of one of its snags,
-  // `least` m from the walker or more
+  // a place on the path near its home for it to walk to or come down on, between `from` and `to` metres from it and
+  // `least` from the walker or more
   const ravenSpot = (bird, walker, from, to, least) => {
     const group = groups[bird.group];
-    for (let tries = 0; tries < 16; tries++) {
-      const a = chance() * TAU,
-        r = between(from, to),
-        x = bird.x + cos(a) * r,
-        z = bird.z + sin(a) * r,
-        p = avoid(x, z, 0.3);
-      if (hypot(p[0] - x, p[1] - z) > 0.01 || !openGround(x, z) || !dry(x, z)) continue;
-      if (group.snags.every((k) => hypot(x - seat[k * 4], z - seat[k * 4 + 2]) > group.r)) continue;
-      if (hypot(x - walker.x, z - walker.z) > least) return [x, z];
+    // (the loop's points near its perches it may walk: clear of trunks and rails, under open sky)
+    group.walks ??= paths[0].filter(([x, z]) => {
+      const p = avoid(x, z, 0.3);
+      return (
+        [...group.snags, ...group.lows].some(
+          (k) => hypot(x - seat[k * 4], z - seat[k * 4 + 2]) < RAVEN_REACH,
+        ) &&
+        hypot(p[0] - x, p[1] - z) < 0.01 &&
+        openGround(x, z) &&
+        dry(x, z) &&
+        veil(x, ground(x, z) + 1, z, 0, 1, 0, 40) < OPEN_SKY
+      );
+    });
+    const fits = group.walks.filter(([x, z]) => {
+      const d = hypot(x - bird.x, z - bird.z);
+      return d >= from && d <= to && hypot(x - walker.x, z - walker.z) > least;
+    });
+    for (let tries = 0; tries < 4 && fits.length; tries++) {
+      const [x0, z0] = fits[floor(chance() * fits.length)],
+        x = x0 + between(-0.3, 0.3),
+        z = z0 + between(-0.3, 0.3);
+      if (openGround(x, z) && dry(x, z)) return [x, z];
     }
     return null;
   };
-  // Approached: a crouch, a jump, and off with deep slow beats, low and then climbing, to its other snag if that
-  // lies out of the walker's way; else away over the open, up and out of sight
+  // up to a free low perch of its home, `least` m from the walker or more
+  const toLow = (bird, walker, least) => {
+    const free = groups[bird.group].lows.filter(
+      (k) =>
+        !taken[k] &&
+        k !== bird.perch &&
+        hypot(seat[k * 4] - walker.x, seat[k * 4 + 2] - walker.z) > least,
+    );
+    for (let tries = 0; tries < 3 && free.length; tries++) {
+      const k = free.splice(floor(chance() * free.length), 1)[0];
+      if (flyTo(bird, feet(bird, k, 0), k, walker)) return true;
+    }
+    return false;
+  };
+  // down to walk the path near its home
+  const toPath = (bird, walker, from, to, least) => {
+    const spot = ravenSpot(bird, walker, from, to, least);
+    return (
+      !!spot &&
+      flyTo(bird, [spot[0], ground(spot[0], spot[1]), spot[1]], -1, walker)
+    );
+  };
+  // Approached: a crouch, a jump, and off with deep slow beats, low and then climbing, to a snag of its home if one
+  // lies out of the walker's way, or a low perch far from them; else away over the open, up and out of sight
   const ravenFlee = (bird, walker) => {
     const group = groups[bird.group];
     bird.fleeIn = 0.5; // (no way out just now: it tries again in a moment)
@@ -2034,6 +2337,7 @@ export function makeBirds({
       if (hypot(x - walker.x, z - walker.z) < 12) continue;
       if (flyTo(bird, feet(bird, k, 0), k, walker)) return true;
     }
+    if (toLow(bird, walker, 18)) return true;
     const away = atan2(bird.z - walker.z, bird.x - walker.x);
     for (const far of [38, 27, 18])
       for (const turn of [0, 0.5, -0.5, 1, -1, 1.5, -1.5, 2, -2]) {
@@ -2055,7 +2359,12 @@ export function makeBirds({
       rest = restOf(bird);
     bird.actT += h;
     bird.fleeIn = (bird.fleeIn || 0) - h;
-    if (dist < kind.leave * bird.bold && bird.fleeIn <= 0 && ravenFlee(bird, walker)) {
+    // (a walker who keeps to the path it lets come nearer)
+    if (
+      dist < (pale(walker.x, walker.z) ? PATH_LEAVE : kind.leave) * bird.bold &&
+      bird.fleeIn <= 0 &&
+      ravenFlee(bird, walker)
+    ) {
       bird.walk = null;
       bird.stride = 0;
       return;
@@ -2064,7 +2373,14 @@ export function makeBirds({
     if (bird.act === 'peck') {
       // it bends to the ground, a stab or two, and up again
       const beat = bird.actT % 0.7,
-        down = beat < 0.25 ? smooth(beat / 0.25) : beat < 0.4 ? 1 : beat < 0.6 ? 1 - smooth((beat - 0.4) / 0.2) : 0;
+        down =
+          beat < 0.25
+            ? smooth(beat / 0.25)
+            : beat < 0.4
+              ? 1
+              : beat < 0.6
+                ? 1 - smooth((beat - 0.4) / 0.2)
+                : 0;
       bird.pitch = rest - 0.9 * down;
       bird.nod = -0.4 * down;
       if (bird.actT >= bird.pecks * 0.7) {
@@ -2081,7 +2397,14 @@ export function makeBirds({
       bird.nod = -0.55 * k + 0.08 * sin(t * 13) * k;
       bird.ruffle = 0.35 * k;
       if (t >= bird.preenT) {
-        Object.assign(bird, { head: 0, headTo: 0, nod: 0, ruffle: 0, act: 'still', actT: 0 });
+        Object.assign(bird, {
+          head: 0,
+          headTo: 0,
+          nod: 0,
+          ruffle: 0,
+          act: 'still',
+          actT: 0,
+        });
         bird.next = wait(3);
       }
       return;
@@ -2089,7 +2412,8 @@ export function makeBirds({
     if (bird.act === 'hackles') {
       // the throat's feathers ruffled out into a beard, and smoothed again
       const t = bird.actT;
-      bird.ruffle = t < 0.3 ? t / 0.3 : t < 1.1 ? 1 : max(0, 1 - (t - 1.1) / 0.5);
+      bird.ruffle =
+        t < 0.3 ? t / 0.3 : t < 1.1 ? 1 : max(0, 1 - (t - 1.1) / 0.5);
       if (t > 1.6) {
         Object.assign(bird, { ruffle: 0, act: 'still', actT: 0 });
         bird.next = wait(3);
@@ -2097,11 +2421,11 @@ export function makeBirds({
       return;
     }
     if (rain) {
-      // in the rain: on its snag, hunched (its feathers out, its head drawn in), still
+      // in the rain: on a perch, hunched (its feathers out, its head drawn in), still
       bird.ruffle += (0.55 - bird.ruffle) * min(1, h / 2);
       bird.nod += (-0.3 - bird.nod) * min(1, h / 2);
       bird.head *= 1 - min(1, h / 2);
-      if (bird.mode === 'ground')
+      if (bird.mode === 'ground' && !toLow(bird, walker, PATH_LEAVE * 2))
         for (const k of group.snags)
           if (!taken[k] && flyTo(bird, feet(bird, k, 0), k, walker)) return;
       return;
@@ -2115,11 +2439,19 @@ export function makeBirds({
     const pick = chance(),
       calm = dist > 25;
     if (bird.mode === 'perch') {
-      // on its snag: a preen, its hackles, a shift of its feet; or down to walk the open ground near, unwatched
-      if (pick < 0.12 && calm) {
-        const spot = ravenSpot(bird, walker, 4, 14, 20);
-        if (spot && flyTo(bird, [spot[0], ground(spot[0], spot[1]), spot[1]], -1, walker)) return;
-      }
+      // Fled up to its snag, it comes back down to a low perch or the path once the walker is well away. On a low
+      // perch: now and then down to walk the path (the meadow's raven often), or across to another perch; else a
+      // preen, its hackles, a shift of its feet
+      if (group.snags.includes(bird.perch)) {
+        if (
+          calm &&
+          chance() < 0.3 &&
+          (toLow(bird, walker, 20) || toPath(bird, walker, 3, 30, 20))
+        )
+          return;
+      } else if (chance() < DOWN[group.home]) {
+        if (toPath(bird, walker, 1.5, 14, PATH_LEAVE * 2)) return;
+      } else if (chance() < 0.08 && toLow(bird, walker, PATH_LEAVE * 2)) return;
       if (pick < 0.3) {
         bird.act = 'preen';
         bird.headTo = chance() < 0.5 ? 1 : -1;
@@ -2133,12 +2465,11 @@ export function makeBirds({
       bird.actT = 0;
       return;
     }
-    // on the ground: a walk, a peck, a preen; up to a snag again after a while
+    // on the ground: a walk, a peck, a preen; up to a low perch again after a while
     bird.walked = (bird.walked || 0) + 1;
-    if (pick < 0.12 || bird.walked > 14) {
+    if (pick < 0.1 || bird.walked > 14) {
       bird.walked = 0;
-      for (const k of group.snags)
-        if (!taken[k] && flyTo(bird, feet(bird, k, 0), k, walker)) return;
+      if (toLow(bird, walker, PATH_LEAVE * 2)) return;
     }
     if (pick < 0.55) {
       const spot = ravenSpot(bird, walker, 1.5, 5, 10);
@@ -2154,16 +2485,29 @@ export function makeBirds({
     } else return;
     bird.actT = 0;
   };
-  // gone over or away and out of sight: back on a free snag of its home once the walker would not see it come
+  // gone over or away and out of sight: back on a free perch of its home (a low one first) once the walker would
+  // not see it come
   const ravenBack = (bird, h, walker) => {
     bird.next -= h;
     if (bird.next > 0) return;
     bird.next = between(3, 6);
-    for (const k of groups[bird.group].snags)
-      if (!taken[k] && !inSight(seat[k * 4], seat[k * 4 + 2], walker)) {
+    const group = groups[bird.group];
+    for (const k of [...group.lows, ...group.snags])
+      if (
+        !taken[k] &&
+        !inSight(seat[k * 4], seat[k * 4 + 2], walker) &&
+        hypot(seat[k * 4] - walker.x, seat[k * 4 + 2] - walker.z) > 12
+      ) {
         bird.perch = -1;
-        sitOn(bird, k, 0);
-        Object.assign(bird, { act: 'still', actT: 0, away: false, flight: null, stride: 0, walk: null });
+        ravenSits(bird, k);
+        Object.assign(bird, {
+          act: 'still',
+          actT: 0,
+          away: false,
+          flight: null,
+          stride: 0,
+          walk: null,
+        });
         return;
       }
   };
@@ -2173,15 +2517,19 @@ export function makeBirds({
   let overIn = between(60, 150), // seconds of walking till the next
     skyCheck = 0,
     skyOpen = false;
-  const overhead = (walker) => veil(walker.x, walker.y, walker.z, 0, 1, 0, 40) < 40;
+  const overhead = (walker) =>
+    veil(walker.x, walker.y, walker.z, 0, 1, 0, 40) < OPEN_SKY;
   const flyover = (walker, forced) => {
-    if (!forced && !overhead(walker)) return [null, 'no open sky over the walker'];
+    if (!forced && !overhead(walker))
+      return [null, 'no open sky over the walker'];
     const free = birds.filter(
       (b) =>
         b.kind.name === 'raven' &&
         !b.held &&
         b.mode !== 'fly' &&
-        (b.mode === 'gone' || groups[b.group].asleep || !inSight(b.x, b.z, walker)),
+        (b.mode === 'gone' ||
+          groups[b.group].asleep ||
+          !inSight(b.x, b.z, walker)),
     );
     if (!free.length) return [null, 'no raven out of sight'];
     const fl = hypot(walker.fx, walker.fz) || 1,
@@ -2226,17 +2574,40 @@ export function makeBirds({
         curveAt(curve, k / n, P);
         if (P[1] < ground(P[0], P[2]) + 7) clear = false;
         // (the walker where they will be when it gets there)
-        const at = { ...walker, x: walker.x + walker.vx * (span * k) / n, z: walker.z + walker.vz * (span * k) / n };
+        const at = {
+          ...walker,
+          x: walker.x + (walker.vx * (span * k)) / n,
+          z: walker.z + (walker.vz * (span * k)) / n,
+        };
         if (!clear || !inSight(P[0], P[2], at)) continue;
-        // (and not over the top of a level view)
+        // (behind the crowns it is unseen; in the open, never through a trunk, and not over the top of a level view)
         const d = hypot(P[0] - at.x, P[1] - walker.y, P[2] - at.z),
-          ahead = (P[0] - at.x) * fx + (P[2] - at.z) * fz;
-        if (P[1] - walker.y > 0.55 * ahead) continue;
-        const q = avoid(P[0], P[2], 0.2);
-        if (veil(at.x, walker.y, at.z, (P[0] - at.x) / d, (P[1] - walker.y) / d, (P[2] - at.z) / d, d) >= 30)
+          ahead = (P[0] - at.x) * fx + (P[2] - at.z) * fz,
+          across = (P[2] - at.z) * fx - (P[0] - at.x) * fz;
+        if (
+          veil(
+            at.x,
+            walker.y,
+            at.z,
+            (P[0] - at.x) / d,
+            (P[1] - walker.y) / d,
+            (P[2] - at.z) / d,
+            d,
+          ) >= 30
+        )
           continue;
-        if (k < ends || k > n - ends || hypot(q[0] - P[0], q[1] - P[2]) > 0.01) clear = false;
-        else seen++;
+        const q = avoid(P[0], P[2], 0.2);
+        if (hypot(q[0] - P[0], q[1] - P[2]) > 0.01) {
+          clear = false;
+          continue;
+        }
+        if (P[1] - walker.y > 0.55 * ahead) continue;
+        if (k < ends || k > n - ends) clear = false;
+        else if (
+          abs(across) < FRAME_W * ahead &&
+          P[1] - walker.y < FRAME_UP * ahead
+        )
+          seen++;
       }
       if (!clear || seen < 5) continue;
       const pair = free.length > 1 && chance() < 0.4,
@@ -2245,7 +2616,10 @@ export function makeBirds({
         // (the second a little behind and to one side of the first)
         const lag = k ? between(0.8, 1.6) : 0,
           off = k ? between(1.5, 3) * (chance() < 0.5 ? 1 : -1) : 0,
-          c = curve.map((v, i) => v + (i % 3 === 0 ? -dz * off : i % 3 === 2 ? dx * off : 0));
+          c = curve.map(
+            (v, i) =>
+              v + (i % 3 === 0 ? -dz * off : i % 3 === 2 ? dx * off : 0),
+          );
         if (bird.perch >= 0) taken[bird.perch] = null;
         Object.assign(bird, {
           perch: -1,
@@ -2262,7 +2636,15 @@ export function makeBirds({
           stride: 0,
           walk: null,
           away: true,
-          flight: { curve: c, t: -lag, T, burst: 0.4, perch: -2, cruise: true, over: true },
+          flight: {
+            curve: c,
+            t: -lag,
+            T,
+            burst: 0.4,
+            perch: -2,
+            cruise: true,
+            over: true,
+          },
         });
       });
       return [free[0], pair ? 'a pair' : 'one'];
@@ -2317,7 +2699,7 @@ export function makeBirds({
       else if (bird.mode !== 'fly' && bird.kind.name === 'raven')
         onRaven(bird, h, walker);
       else if (bird.mode === 'ground') onGround(bird, h, walker);
-      else if (bird.mode === 'fly') onWing(bird, h);
+      else if (bird.mode === 'fly') onWing(bird, h, walker);
       else onPerch(bird, h, walker);
     }
   };
@@ -2453,10 +2835,14 @@ export function makeBirds({
         group.asleep =
           !on ||
           // (a raven's by where it is: its two snags may lie far apart)
-        ((group.lives === 'raven'
-          ? birds.every((b) => b.group !== g || hypot(b.x - walker.x, b.z - walker.z) > SLEEP)
-          : hypot(group.x - walker.x, group.z - walker.z) > SLEEP) &&
-          !birds.some((b) => b.group === g && (b.away || b.held)));
+          ((group.lives === 'raven'
+            ? birds.every(
+                (b) =>
+                  b.group !== g ||
+                  hypot(b.x - walker.x, b.z - walker.z) > SLEEP,
+              )
+            : hypot(group.x - walker.x, group.z - walker.z) > SLEEP) &&
+            !birds.some((b) => b.group === g && (b.away || b.held)));
       });
       for (const bird of birds) {
         if (!bird.away || bird.held || bird.mode !== 'perch') continue;
@@ -2623,8 +3009,15 @@ export function makeBirds({
         for (const b of birds)
           if (b.group === bird.group && b.mode === 'perch')
             b.calm = b.comeDown + 1;
-      } else if (what === 'walk' && bird.kind.name === 'raven' && bird.mode === 'ground')
-        startWalk(bird, [bird.x + cos(bird.yaw) * 3, bird.z + sin(bird.yaw) * 3]);
+      } else if (
+        what === 'walk' &&
+        bird.kind.name === 'raven' &&
+        bird.mode === 'ground'
+      )
+        startWalk(bird, [
+          bird.x + cos(bird.yaw) * 3,
+          bird.z + sin(bird.yaw) * 3,
+        ]);
       else if (what === 'fly' && perched) flit(bird, walker);
       else if (what === 'hop' && perched) {
         bird.run = 2;

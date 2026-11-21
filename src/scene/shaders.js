@@ -11,6 +11,7 @@ import {
   WATER,
 } from './quality.js';
 import { LAKE, NX, NY, NZ, OPEN, OX, OY, OZ, TDN, VS } from './math.js';
+import { DEER_WGSL } from './deer.js';
 import { SN } from './water.js';
 import { PICS, SLOTS, STEM_B, STEM_T, STEM_W } from './sprigs.js';
 
@@ -561,6 +562,7 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   o.n = vec3f(0., a.y, a.x) * w.x + vec3f(b.x, 0., b.y) * w.y + vec3f(c.x, c.y, 0.) * w.z;
   return o;
 }
+${DEER_WGSL}
 @fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
   let mat = i32(i.m.x + .5); let sd = i.m.y; let fl_ = select(-1., 1., ff);
   let on = normalize(i.on) * fl_; let n0 = normalize(i.n) * fl_;
@@ -596,6 +598,8 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   var mud = 0.;                        // and how much of that is a muddy patch
   var film = 0.;                       // standing or running water over the ground: the creek, the shore, puddles
   var glw = vec3f(0.); var gk = 0.;    // animals: the glow of an owl's eyes, and how much of an eye this is
+  var wrapL = 0.;                      // how far the sun's light wraps round a coat (a deer's: fur scatters it)
+  var sunK = 1.;                       // and how much of it the coat takes direct
   var grain = 0.;                      // how deep the streaks of Wd cut: bark furrows, the grain of planks
   var sawn = 0.;                       // timber: how much this is a sawn end face
   let mossC = mix(vec3f(.08, .19, .02), vec3f(.21, .34, .04), C.h) * (.5 + .9 * B.h);
@@ -821,6 +825,8 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
     gk = ss(-.2, -.7, i.ao);
     alb = mix(alb, vec3f(.012), gk);
     gloss = .3 + .5 * gk; bump = .5;
+    // a deer (deer.js): its own coat, by its part (species 8 and over)
+    if (sp >= 8) { let dc = deerCoat(sp - 8, lp / ts, on, i.ao, hv, B.h * .5 + C.h * .5); alb = mix(dc.rgb, vec3f(.012), gk); gloss = mix(dc.a, .8, gk); bump = .08; wrapL = .6; sunK = .6; }
   }
   // Where a trunk, a post, a log or a stone meets the ground (within a hand or two over it, on its upright faces):
   // darker, and a little of the ground's moss on it
@@ -843,10 +849,10 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   let L = g.sun.xyz; let V = normalize(g.cam.xyz - i.wp);
   let ao = (sat((v1.r - .5) * 8.) * .55 + sat((v2.r - .5) * 2.7) * .45) * vao * ss(.12, .6, hgt);
   let E = sunE() * shadow9(i.wp + n0 * .1 + L * .12) * dp * mix(1., .78, f32(mat == 0));
-  let ndl = sat(dot(N, L)); let ndv = sat(dot(N, V));
+  let ndl = sat((dot(N, L) + wrapL) / (1. + wrapL)); let ndv = sat(dot(N, V));
   let open = sat((v2.r - .5) * 2.7);
   let am = (amb(N, v1.g) + side(N, open)) * ao;
-  var c = alb * (E * (ndl + tl * (.2 + .5 * sat(-dot(N, L)))) + am);
+  var c = alb * (E * sunK * (ndl + tl * (.2 + .5 * sat(-dot(N, L)))) + am);
   let H = normalize(V + L); let R = reflect(-V, N);
   // (what lies under a stream has no highlights of its own: the water's surface over it has them)
   let dry = 1. - under;
@@ -1451,17 +1457,19 @@ struct BV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
 // head's own pitch. Each part moves in its own way, told by the vertex's aux (a whole number of 127ths); a
 // feather's place across and along its vane rides in its normal
 const JAX = .2; // a jay's axis over its feet, in lengths (birds.js meshCorvid)
-const RAX = .28; // a raven's: its heavy body carried higher on longer legs (birds.js RAVEN.lift)
+const RAX = .30; // a raven's: its heavy body carried higher on longer legs (birds.js RAVEN.lift)
 // Where a build's parts lie (birds.js JAY and RAVEN, kept the same): its axis over the feet, the shoulder (x, z of
 // the wing's bones), the wing's length out from it and the wrist's, where the hand's last primary roots, how close
 // the shut wing folds, the flank the shut wing lies on (its width at the front and over the tail, by how far back),
 // the tail's root, how wide it fans (shut, and more as it opens), the foot's x and the top of the shank that keeps
 // upright, the head's turning part (from z, to z) with its pivot (y over the axis, z); the wingbeat (the arm's swing,
-// the hand's, how far the hand lags, the arm's mean lift), and a walk's stride (0: it hops, not walks)
-struct Form { ax: f32, sh: vec2f, wl: f32, wr: f32, fe: f32, fold: f32, flank: vec4f, tr: f32, fan: vec2f, foot: f32, shank: f32, head: vec4f, beat: vec4f, stride: f32 };
+// the hand's, how far the hand lags, the arm's mean lift), a walk's stride (0: it hops, not walks), and how the shut
+// wing covers the flank (its top edge raised, its depth, the share of that its primaries lose over the tail, its top
+// edge drawn in over the back), and how far the spread hand reaches out against its build (a raven spans 2.2 lengths)
+struct Form { ax: f32, sh: vec2f, wl: f32, wr: f32, fe: f32, fold: f32, flank: vec4f, tr: f32, fan: vec2f, foot: f32, shank: f32, head: vec4f, beat: vec4f, stride: f32, cover: vec4f, span: f32 };
 fn formOf(raven: bool) -> Form {
-  if (raven) { return Form(RAX, vec2f(.07, .19), 1.18, .48, .66, .74, vec4f(.128, .03, .2, .36), -.12, vec2f(.02, .14), .065, .14, vec4f(.215, .28, .09, .24), vec4f(.9, 1.1, .5, .05), .2); }
-  return Form(JAX, vec2f(.07, .21), .62, .26, .36, 1., vec4f(.128, .03, .2, .42), -.14, vec2f(.012, .1), .055, .1, vec4f(.235, .3, .095, .26), vec4f(.7, 1., .9, .12), 0.);
+  if (raven) { return Form(RAX, vec2f(.07, .19), 1.18, .48, .66, .8, vec4f(.134, .035, .2, .4), -.12, vec2f(.02, .14), .065, .14, vec4f(.215, .28, .09, .24), vec4f(.9, 1.1, .5, .05), .2, vec4f(.045, 1.25, .35, .4), .82); }
+  return Form(JAX, vec2f(.07, .21), .62, .26, .36, 1., vec4f(.128, .03, .2, .42), -.14, vec2f(.012, .1), .055, .1, vec4f(.235, .3, .095, .26), vec4f(.7, 1., .9, .12), 0., vec4f(0., .85, .85, 0.), 1.);
 }
 struct JI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) q: vec4f, @location(4) c: vec4f, @location(5) d: vec4f };
 struct JV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f, @location(3) @interpolate(flat) part: f32, @location(4) lt: f32, @location(5) fe: vec2f, @location(6) @interpolate(flat) open: f32, @location(7) @interpolate(flat) kind: f32 };
@@ -1497,13 +1505,14 @@ struct JV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
     let aF = mix(1.5 + .06 * hand, mix(1.5, mix(1.5, .28, ss(F.wr + .005, F.fe, cx)), hand), s);
     let wp2 = bone + vec2f(cos(aF), sin(aF)) * dist + vec2f(sin(aF), -cos(aF)) * lat;
     let a1 = (sin(ph) * F.beat.x + F.beat.w) * s; let a2 = (sin(ph - F.beat.z) * F.beat.y + .05) * s;
-    let reach = max(wp2.x, 0.); let inner = min(reach, wrist.x);
-    let beat = vec2f(inner * cos(a1) + (reach - inner) * cos(a2), inner * sin(a1) + (reach - inner) * sin(a2));
+    let reach = max(wp2.x, 0.); let inner = min(reach, wrist.x); let outer = (reach - inner) * F.span;
+    let beat = vec2f(inner * cos(a1) + outer * cos(a2), inner * sin(a1) + outer * sin(a2));
     let openP = vec3f(side * (F.sh.x + beat.x), F.ax + .07 + lift + beat.y, F.sh.y - wp2.y);
     let bk = wp2.y * F.fold; // (a long wing folds closer: a raven's tips reach most of the way down its tail)
-    let shutP = vec3f(side * (mix(F.flank.x, F.flank.y, ss(F.flank.z, F.flank.w, bk)) + .12 * reach + lift), F.ax + mix(.08, .085, ss(.1, .4, bk)) - .85 * reach * (1. - .85 * ss(.15, .4, bk)), F.sh.y - .01 - bk);
+    let shutP = vec3f(side * (mix(F.flank.x, F.flank.y, ss(F.flank.z, F.flank.w, bk)) * (1. - F.cover.w * ss(.05, 0., reach)) + .12 * reach + lift), F.ax + mix(.08, .085, ss(.1, .4, bk)) + F.cover.x - F.cover.y * reach * (1. - F.cover.z * ss(.15, .4, bk)), F.sh.y - .01 - bk);
     l = mix(shutP, openP, s);
-    n = normalize(mix(vec3f(side, .35, 0.), vec3f(-side * sin(a1) * .8, 1., 0.), s));
+    // (shut, a raven's wing is rounded over its flank: its top edge faces up, its lower edge out and down)
+    n = normalize(mix(vec3f(side, .35 + F.cover.w * (1.5 - 25. * reach), 0.), vec3f(-side * sin(a1) * .8, 1., 0.), s));
   } else if (abs(code) > 2. && abs(code) < 12.) {
     // a tail feather turns about the tail's root, the further out the more: hardly at all shut, wide when fanned
     part = 2.; fe = i.n.xy / max(i.n.z, .01);
@@ -1563,7 +1572,7 @@ struct JV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   let feathery = part == 1 || part == 2 || part == 3 || part == 7;
   var n = normalize(i.n); if (!feathery) { n = n * select(-1., 1., ff); }
   let V = normalize(g.cam.xyz - i.wp); let L = g.sun.xyz;
-  if (i.kind > .5) { return ravenC(i.op, i.fe, i.wp, i.lt, ff, part, n, V); }
+  if (i.kind > .5) { return ravenC(i.op, i.fe, i.wp, i.lt, ff, part, n, V, i.open); }
   // A Steller's jay: the whole front of it sooty charcoal with a brown cast (head, crest, neck, breast, shoulders,
   // upper back), melting into a dusky grey-blue on the belly and the rump; only the wings and the tail a deeper
   // blue, barred finely with black; short pale streaks on the forehead, a faint pale arc over the eye
@@ -1603,44 +1612,55 @@ struct JV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   c += amb(up, sky) * alb * pow(1. - sat(dot(n, V)), 3.) * .45 * sat(n.y + .3);
   return fin(fog(c, i.wp));
 }
-// A common raven: black, never a hole. True black with a hint of blue whose form is read in its gloss: the sky
-// mirrored grey in every plane, so each has its own tone even in shade; on the crown, the back, the coverts and the
-// throat, where sun or open sky strikes them, a blue-violet sheen; the flight feathers and the underside matte, the
-// folded wing's rows of feather edges faintly paler; a pale sheen along the bill's ridge, a glint in the eye, a
-// thin rim of sky light. Lit, shadowed and fogged as all else is
-fn ravenC(p: vec3f, fe: vec2f, wp: vec3f, lt: f32, ff: bool, part: i32, n0: vec3f, V: vec3f) -> vec4f {
+// A common raven: black, never a hole. True black, its form read in what it mirrors of the sky: what faces up takes a
+// soft grey sheen, the flanks less, the belly none; the feathers' edges in rows pale grey-blue on the folded wing and
+// the tail; on the back, the coverts and the hackles a blue-violet gloss where sky or sun strikes them; a pale line
+// along the bill's ridge, a glint in the eye, a thin rim of sky light. Lit, shadowed and fogged as all else is
+fn ravenC(p: vec3f, fe: vec2f, wp: vec3f, lt: f32, ff: bool, part: i32, n0: vec3f, V: vec3f, open: f32) -> vec4f {
   let h = p.y - RAX; let u = fe.x; let v = fe.y; let L = g.sun.xyz;
   let fluff = textureSampleLevel(tD, sR, p.zy * 2.3 + p.x * 1.7, 0.);
-  let n = select(n0, -n0, !ff && (part == 1 || part == 2 || part == 7)); // (a feather seen from under is lit from under)
-  var alb = vec3f(.024, .024, .026) * (.8 + .4 * fluff.a); var gl = .55; var occ = 1.;
+  // (a spread feather seen from under is lit from under; a shut wing's and a hackle's normal already face out)
+  let n = select(n0, -n0, !ff && ((part == 1 && open > .5) || part == 2));
+  var alb = vec3f(.01, .011, .016) * (.8 + .4 * fluff.a); var gl = .55; var occ = 1.;
   var tint = 0.; // (how much of the gloss is the blue-violet sheen)
+  var edge = 0.; // (a feather's edge or tip, or a row of them)
+  var ridge = 0.;
   if (part == 0) {
     // (the crown, the back and the throat glossiest and tinted, the belly least; the bill dull, but for its ridge)
-    gl = mix(.25, .75, ss(-.07, .06, h)); tint = ss(-.02, .08, h);
-    let bill = ss(.372, .378, p.z); alb = mix(alb, vec3f(.022), bill);
-    gl = mix(gl, mix(.2, 1.1, ss(.55, .9, n.y)), bill); tint *= 1. - bill;
-    occ = mix(.55, 1., ss(-.16, -.02, h));
+    gl = mix(.3, .75, ss(-.07, .06, h)); tint = ss(-.02, .08, h);
+    let bill = ss(.372, .378, p.z); alb = mix(alb, vec3f(.014), bill);
+    gl = mix(gl, .5, bill); tint *= 1. - bill; ridge = bill * ss(.55, .9, n.y);
+    occ = mix(.45, 1., ss(-.18, -.02, h));
   } else if (part == 1 || part == 2) {
-    // a flight feather matte, paler along the edge that lies over the next; the coverts glossy
-    let edge = ss(.45, .95, abs(u)) * step(0., v); let covert = f32(v < -.05);
-    alb = vec3f(.022, .022, .024) * (1. + 2.2 * edge) * mix(1., .75, ss(.8, 1., v));
-    gl = mix(.25 + .35 * edge, .8, covert); tint = covert;
-    if (part == 2) { gl = .45; tint = .3; }
-    if (!ff) { alb = vec3f(.04, .04, .042); gl = .15; tint = 0.; }
-  } else if (part == 7) { alb *= .8 + .4 * ss(.2, .9, v); gl = .75; tint = 1.; }
-  else if (part == 4) { alb = vec3f(.028); gl = .25; }
-  else if (part == 5) { alb = vec3f(.01, .007, .006); gl = 1.; }
+    // a flight feather matte, its outer edge and tip pale; the coverts glossy, in rows of tips
+    let covert = f32(v < -.05);
+    edge = max(ss(.5, .95, abs(u)), ss(.82, .97, v)) * step(0., v) + ss(.6, .95, fract(abs(p.x) * 22.)) * covert;
+    alb = vec3f(.012, .012, .015) * mix(1., .75, ss(.8, 1., v));
+    gl = mix(.35, .7, covert); tint = mix(.15, 1., covert);
+    if (part == 2) { gl = .35; tint = .2; edge *= .45; }
+    // (a spread wing's and tail's underside a dull dark grey; shut, their backs are as dark as the rest)
+    if (!ff && open > .5) { alb = vec3f(.03, .03, .032); gl = .15; tint = 0.; edge *= .3; }
+  } else if (part == 7) { alb = vec3f(.02, .02, .024) * (.8 + .4 * ss(.2, .9, v)); gl = .8; tint = 1.; edge = .6 * ss(.3, 1., v); }
+  else if (part == 4) { alb = vec3f(.02); gl = .3; }
+  else if (part == 5) { alb = vec3f(.008, .006, .005); gl = 1.; }
   let E = sunE() * lt; let sky = vol(wp).g; let up = vec3f(0., 1., 0.);
   let nv = sat(dot(n, V)); let R = reflect(-V, n);
-  // (the light on black near grey: only the tinted gloss takes the sky's blue, blue face on, violet at a glance)
+  // (the light on black near grey: only the tinted gloss takes a hue, blue face on, violet at a glance)
   let a = amb(n, sky); let ag = mix(vec3f(dot(a, vec3f(.3, .5, .2))), a, .35);
-  let m = amb(R, sky); let ml = dot(m, vec3f(.3, .5, .2)); let mg = mix(vec3f(ml), m, .2);
-  let sheen = mix(vec3f(.62, .52, .92), vec3f(.52, .6, .92), nv);
-  // (the sheen only where bright sky is mirrored: in deep shade the gloss is grey)
-  let env = mix(mg, m * sheen * 1.25, tint * ss(.15, .45, ml)) * occ * (.16 + .84 * pow(1. - nv, 2.5));
+  let m = amb(R, sky); let ml = dot(m, vec3f(.3, .5, .2)); let mg = mix(vec3f(ml), m, .1);
+  let sheen = mix(vec3f(1.), mix(vec3f(1.05, .78, 1.42), vec3f(.8, .92, 1.45), nv), .55); // (as bright as grey)
+  let hue = mix(vec3f(1.), sheen, tint);
+  let fres = occ * (.2 + .45 * pow(1. - nv, 3.)); // (kept low at a glance: no pale rim along the crown)
+  let env = mg * fres * mix(vec3f(1.), sheen, tint * ss(.05, .16, ml * fres));
+  // (the sun's glint on black: half its own warmth, half white)
+  let Es = mix(vec3f(dot(E, vec3f(.3, .5, .2))), E, .5);
+  let skyL = dot(amb(up, sky), vec3f(.3, .5, .2)); let face = sat(.5 + .5 * n.y);
   var c = alb * (E * sat(dot(n, L)) + ag * occ * 1.5);
-  c += gl * (env * .27 + mix(vec3f(.8), sheen, tint) * E * pow(sat(dot(n, normalize(L + V))), 14.) * ss(0., .2, dot(n, L)) * .2);
-  c += amb(up, sky) * f32(part == 5) * pow(sat(dot(n, normalize(up + V))), 40.) * 1.2;
+  c += gl * hue * skyL * face * face * occ * .2;
+  c += gl * (env * .45 + mix(vec3f(.8), sheen * .8, tint) * Es * pow(sat(dot(n, normalize(L + V))), 24.) * ss(0., .2, dot(n, L)) * .16);
+  c += vec3f(.75, .85, 1.) * skyL * edge * (.35 + .65 * face) * occ * .22;
+  c += skyL * ridge * vec3f(.22);
+  c += amb(up, sky) * f32(part == 5) * (.06 + pow(sat(dot(n, normalize(up + V))), 20.) * 1.);
   c += dot(amb(up, sky), vec3f(.3, .5, .2)) * vec3f(.06) * pow(1. - nv, 3.) * sat(n.y + .3);
   return fin(fog(c, wp));
 }

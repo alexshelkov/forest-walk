@@ -118,6 +118,7 @@ import {
 } from './world.js';
 import { sound, soundPause, soundResume } from './audio.js';
 import { makeCreatures } from './creatures.js';
+import { makeDeer } from './deer.js';
 import {
   FIRST_JAY_AT,
   JAY_SPACING,
@@ -128,6 +129,7 @@ import {
   meshPerchStick,
   meshRaven,
   meshSongbird,
+  RAVEN_REACH,
 } from './birds.js';
 
 // Switched off while the forest itself is being worked on. ANIMALS: the deer, fox, squirrels, owls and ducks of
@@ -1402,6 +1404,17 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       shove(x, z, pad);
       return [P2[0], P2[1]];
     },
+    standing: (x, z, pad) => {
+      const gx = cellOf(x, OX),
+        gz = cellOf(z, OZ);
+      for (let j = max(gz - 1, 0); j <= min(gz + 1, OBN - 1); j++)
+        for (let i = max(gx - 1, 0); i <= min(gx + 1, OBN - 1); i++) {
+          const a = obst[i + OBN * j];
+          for (let k = 0; k < a.length; k += 3)
+            if (hypot(x - a[k], z - a[k + 1]) < a[k + 2] + pad) return true;
+        }
+      return false;
+    },
     dry: (x, z) => creekAt(x, z)[0] > 0.3 && lakeD(x, z) > 0.8,
     perches: Wd.perches,
     // (the tops of posts in the woods only)
@@ -1424,11 +1437,26 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     paths: Wd.paths,
     pale: (x, z) => trailD(x, z) < trailHalf(trailK(x, z)),
     ravenTops: Wd.ravenSnags,
-    // (a raven walks the lake's shore and the paths, out of the water: the meadow's grass would hide it)
+    // (post tops a metre to three over the ground within three metres of the loop, near the ravens' snags: rails,
+    // fence and sign posts)
+    ravenLows: Array.from({ length: Wd.tops.length / 3 }, (_, i) =>
+      Array.from(Wd.tops.subarray(i * 3, i * 3 + 3)),
+    ).filter(
+      ([x, y, z]) =>
+        y - ground(x, z) > 0.8 &&
+        y - ground(x, z) < 3 &&
+        trailD(x, z) < trailHalf(trailK(x, z)) + 3 &&
+        Wd.ravenSnags.some((s) => hypot(x - s[0], z - s[2]) < RAVEN_REACH),
+    ),
+    // (a raven walks the middle of the loop, out of the water and away from the crossings: grass, reeds, the
+    // path's edges and the dark banks of a creek would hide it)
     openGround: (x, z) =>
       lakeD(x, z) > 0.6 &&
       creekAt(x, z)[0] > 0.5 &&
-      (lakeD(x, z) < 9 || trailD(x, z) < trailHalf(trailK(x, z)) + 0.3),
+      trailD(x, z) < trailHalf(trailK(x, z)) * 0.6 &&
+      Wd.crossings.every(
+        (c) => hypot(x - (c[2] + c[4]) / 2, z - (c[3] + c[5]) / 2) > 8,
+      ),
     veil: (x, y, z, dx, dy, dz, far) => veilFrom(x, y, z, dx, dy, dz, 200, far),
     count: JAYS,
   });
@@ -1451,6 +1479,87 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         snags: byTrail(Wd.snags, 6),
       })
     : { data: new Float32Array(12), groups: [], update() {} };
+  // ---------------------------------------------------------------- deer (deer.js)
+  // Is the line from a to b (an eye and a deer) hidden: by a trunk (every disc of the walker's obstacles over 0.2 m
+  // across its true radius, obst padding them, between the ends), or by the forest it runs through (what Wd.occ
+  // says each metre of it blocks, so that a third or less gets through)
+  const deerHidden = (ax, ay, az, bx, by, bz) => {
+    const len = hypot(bx - ax, bz - az),
+      ux = (bx - ax) / (len || 1),
+      uz = (bz - az) / (len || 1);
+    let blocked = 0;
+    for (let t = 1; t < len - 1; t += 1)
+      blocked +=
+        occ[
+          clamp(floor((ax + ux * t - OX) / OCW), 0, OCN - 1) +
+            OCN * clamp(floor((az + uz * t - OZ) / OCW), 0, OCN - 1)
+        ];
+    if (blocked > 1.1) return true;
+    for (let t = 0; t < len; t += 3) {
+      const a =
+        obst[
+          clamp(floor((ax + ux * t - OX) / OBW), 0, OBN - 1) +
+            OBN * clamp(floor((az + uz * t - OZ) / OBW), 0, OBN - 1)
+        ];
+      for (let k = 0; k < a.length; k += 3) {
+        const r = (a[k + 2] - 0.15) / 1.25,
+          s = (a[k] - ax) * ux + (a[k + 1] - az) * uz;
+        if (r < 0.2 || r > 1.4 || s < 0.5 || s > len - 0.5) continue;
+        if (abs((a[k + 1] - az) * ux - (a[k] - ax) * uz) < r * 0.9) return true;
+      }
+    }
+    return false;
+  };
+  // How closed the crowns are over a place: the share of eight lines of sight from the eye, 50 degrees up all
+  // round, that the crowns veil (what they take of the light, Wd.crown, summed along it to 120, as skyShows has it)
+  const deerCanopy = (x, z) => {
+    const y = ground(x, z) + EYE;
+    let veiled = 0;
+    for (let a = 0; a < 8; a++) {
+      const dx = cos(a * 0.7854) * 0.64,
+        dz = sin(a * 0.7854) * 0.64;
+      let sum = 0;
+      for (let t = 2; t < 40 && sum < 120; t += 2) {
+        const ix = floor((x + dx * t - OX) / VS / 2),
+          iy = floor((y + 0.77 * t - OY) / VS / 2),
+          iz = floor((z + dz * t - OZ) / VS / 2);
+        if (ix < 0 || iz < 0 || iy < 0 || ix >= NX / 2 || iz >= NZ / 2 || iy >= NY / 2) break;
+        sum += Wd.crown[ix + (NX / 2) * (iy + (NY / 2) * iz)];
+      }
+      if (sum >= 120) veiled++;
+    }
+    return veiled / 8;
+  };
+  const deer = makeDeer({
+    add,
+    ground,
+    avoid: (x, z, pad) => {
+      shove(x, z, pad);
+      return [P2[0], P2[1]];
+    },
+    hidden: deerHidden,
+    fogT: (d) => fogT(d),
+    paths: Wd.paths,
+    // (what is built and stands out in the woods: bridges, the boardwalk, the dock; not a fence or a signpost by
+    // the path, which a crossing's line keeps clear of)
+    woodwork: [
+      ...Wd.crossings.flatMap((c) => [
+        [c[2], c[3]],
+        [c[4], c[5]],
+        [(c[2] + c[4]) / 2, (c[3] + c[5]) / 2],
+      ]),
+      ...TRAIL.slice(BOARDWALK[0], BOARDWALK[1] + 1),
+      [Wd.pier[0], Wd.pier[1]],
+      [Wd.pier[2], Wd.pier[3]],
+    ],
+    canopy: deerCanopy,
+    trailD,
+    trailHalf,
+    trailK,
+    creekAt,
+  });
+  let deerClock = 0;
+  // ---------------------------------------------------------------- (deer end)
   let nV = 0,
     nI = 0;
   for (const m of meshes) {
@@ -1519,6 +1628,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     }),
     vbBlot = device.createBuffer({
       size: birds.blots.byteLength,
+      usage: BU.VERTEX | BU.COPY_DST,
+    });
+  // (deer: their parts, their blots)
+  const ibDeer = device.createBuffer({
+      size: deer.data.byteLength,
+      usage: BU.VERTEX | BU.COPY_DST,
+    }),
+    vbDeerBlot = device.createBuffer({
+      size: deer.blots.byteLength,
       usage: BU.VERTEX | BU.COPY_DST,
     });
   const ibChunk = Wd.chunks.map((c) => buf(c.data, BU.VERTEX)),
@@ -2305,6 +2423,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const CATS = ['ground', 'rocks+logs', 'trunks', 'leaves', 'plants', 'air'],
     triBy = new Float64Array(CATS.length); // air: dust, falling leaves, rain
   let cat = 0,
+    birdTris = 0, // (the last frame's, the sticks under them too: debug.birdTris)
     drawN = 0,
     cpuMs = 0;
   // the frame's triangles for each row of LEAVES (debug.tiers)
@@ -2743,6 +2862,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         t = meshes[g.mesh];
       r.drawIndexed(t.ib.length, g.count, t.i0, t.v0, g.first);
     }
+    // deer (deer.js): what is awake of them, part by part
+    r.setVertexBuffer(1, ibDeer);
+    for (const g of deer.groups) {
+      if (!g.count) continue;
+      const t = meshes[g.mesh];
+      r.drawIndexed(t.ib.length, g.count, t.i0, t.v0, g.first);
+      triBy[5] += (t.ib.length / 3) * g.count;
+      drawN++;
+    }
     if (ANIMALS) {
       r.setPipeline(pManta);
       r.setVertexBuffer(1, ibBirds);
@@ -2764,6 +2892,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     // the birds, mesh by mesh (birds.js counts): the songbird's near and far, the jay's, the raven's (the crow
     // family's on vsJay); then the sticks under those that sit on a dead branch, after them in the same buffer
     let nBirds = 0;
+    birdTris = 0;
     for (let slot = 0; slot < 6; slot++) nBirds += birds.counts[slot];
     if (nBirds && !alone) {
       r.setVertexBuffer(1, ibBird);
@@ -2775,6 +2904,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         r.drawIndexed(mesh.ib.length, count, mesh.i0, mesh.v0, first);
         drawN++;
         triBy[5] += (mesh.ib.length / 3) * count;
+        birdTris += (mesh.ib.length / 3) * count;
       }
       if (birds.counts[7]) {
         const stick = meshes[M_SONG + 6];
@@ -2787,6 +2917,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           nBirds,
         );
         drawN++;
+        birdTris += (stick.ib.length / 3) * birds.counts[7];
       }
     }
     // leaves: fewer rows per blade with distance, then thinned-out sets
@@ -2805,6 +2936,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       r.setPipeline(pBlot);
       r.setVertexBuffer(0, vbBlot);
       r.draw(4, birds.counts[6]);
+      drawN++;
+    }
+    // (deer's blots: three under each)
+    if (deer.groups[0].count && !alone) {
+      r.setPipeline(pBlot);
+      r.setVertexBuffer(0, vbDeerBlot);
+      r.draw(4, deer.groups[0].count * 3);
       drawN++;
     }
     // (none of it with a tree alone, but the sky shaded: fsB)
@@ -3651,6 +3789,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       birdClock = F[TIME];
       Q.writeBuffer(ibBird, 0, birds.data);
       Q.writeBuffer(vbBlot, 0, birds.blots);
+      // deer (deer.js), by the scene's clock like the birds
+      deer.update(max(F[TIME] - deerClock, 0), walker, {
+        rain: F[RAIN],
+        storm: F[STORM],
+      });
+      deerClock = F[TIME];
+      Q.writeBuffer(ibDeer, 0, deer.data);
+      Q.writeBuffer(vbDeerBlot, 0, deer.blots);
     }
     render();
     cpuMs += (performance.now() - cpu0 - cpuMs) * 0.05; // a running mean of what a frame costs this thread
@@ -3811,6 +3957,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           screen: onScreen(bird.at[0], bird.at[1] + 0.1, bird.at[2]),
         })),
       birdCross: () => birds.cross(walkerNow()),
+      birdTris: () => birdTris,
       ravens: (count) => birds.ravens(count),
       ravenFlyover: () => birds.flyover(walkerNow()),
       jays: (count) => birds.count(count),
@@ -3947,6 +4094,39 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         ) / 10,
       ],
       creatures: critters,
+      // ---------------------------------------------------------------- deer (deer.js)
+      deerCount: (n) => deer.count(n),
+      deerStretches: () =>
+        deer.stretches.map((s) => {
+          const p = Wd.paths[s.path][(s.from + s.to) >> 1];
+          return [s.path, s.from, s.to, p[0], p[1]];
+        }),
+      deerCross: (stretch, delay = 5, side) => {
+        const r = deer.crossAt(
+          stretch,
+          delay,
+          side ?? (Math.random() < 0.5 ? 1 : -1),
+        );
+        lookAt(
+          r.stand[0],
+          ground(r.stand[0], r.stand[1]) + EYE,
+          r.stand[1],
+          r.at[0],
+          ground(r.stand[0], r.stand[1]) + EYE,
+          r.at[1],
+        );
+        return r;
+      },
+      deerIn: () => deer.pendingIn(),
+      deerRoutes: () => deer.routes(),
+      deerHold: (i, pose, x, z, yaw) => deer.hold(i, pose, x, z, yaw),
+      deerTris: () => deer.tris(meshes),
+      deerProbe: (x, z) => deer.probe(x, z),
+      deerState: () => deer.state(),
+      deerDo: (i, what) => deer.force(i, what, F[CX], F[CZ]),
+      deerWalkTest: (seconds, odds) => deer.walkTest(seconds, odds),
+      deerHomes: () => deer.homeList(),
+      // ---------------------------------------------------------------- (deer end)
     },
     wake: () => {
       if (raf && SOUND) sound(F);

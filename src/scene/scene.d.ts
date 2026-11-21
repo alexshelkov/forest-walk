@@ -102,6 +102,8 @@ export interface Scene {
       over: boolean;
       left: number[] | null;
     }[];
+    /** The last frame's triangles of the birds, the sticks under them included. */
+    birdTris(): number;
     /** How many jays there are; given a count, the world's jays are placed afresh, that many. */
     jays(count?: number): number;
     /**
@@ -190,6 +192,46 @@ export interface Scene {
      * held flat on their cards, as at the edge of the near range. Returns the mode now.
      */
     sprigs(mode?: 0 | 1 | 2): number;
+    // ---------------------------------------------------------------- deer (deer.js)
+    /** How many deer live in the world (0 to 3); returns it. */
+    deerCount(n?: number): number;
+    /** The stretches where a deer may cross the path: path, first and last point, its middle (x, z). */
+    deerStretches(): number[][];
+    /**
+     * A crossing at stretch i: the walker stood on the path 10 m before its place, looking level at it, and the
+     * deer fired `delay` seconds on (0: at once) whatever the weather. Returns where the walker stands, the place
+     * and the side the deer comes from.
+     */
+    deerCross(
+      stretch: number,
+      delay?: number,
+      side?: 1 | -1,
+    ): { stand: number[]; at: number[]; side: number };
+    /** Seconds until the crossing asked for fires (-1: none). */
+    deerIn(): number;
+    /** Every way across a crossing may take: [stretch, side]. */
+    deerRoutes(): number[][];
+    /** A still: deer i held in a pose (stand, graze, alert, walk) at x, z facing yaw; no pose lets it go again. */
+    deerHold(
+      i: number,
+      pose?: 'stand' | 'graze' | 'alert' | 'walk',
+      x?: number,
+      z?: number,
+      yaw?: number,
+    ): number[] | null;
+    /** The deer's triangles in the last frame. */
+    deerTris(): number;
+    /** What decides where deer live and cross, at x, z: crowns' cover, metres to water, to anything built, to an opening; the path's half width; how many homes. */
+    deerProbe(x: number, z: number): number[];
+    /** What each deer is doing: state, x, z, neck pitch, shown (the three at rest, then the two that cross); hoof heights, leg bends, pitch, feet down. */
+    deerState(): (string | number | number[])[][];
+    /** Sets deer i about something now (graze, look, alert, moveoff: away from the walker). */
+    deerDo(i: number, what: string): string;
+    /** How many crossings a walk of `seconds` along the side paths would set off (none run), and how many times the odds were rolled. */
+    deerWalkTest(seconds: number, odds?: number): number[];
+    /** The homes of the deer at rest: x, z, yaw, metres to the nearest path, the path point it is seen nearest from (x, z), how far that is, 1 at the meadow's edge, every path point it is seen from; and the ms the search took. */
+    deerHomes(): { ms: number; homes: (number | number[][])[][] };
+    // ---------------------------------------------------------------- (deer end)
     /**
      * Holds the render size at about n pixels (the frame-time tuner left off), or lets the tuner go again (0).
      * Returns the size now.

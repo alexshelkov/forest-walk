@@ -150,6 +150,43 @@ export function attachDebugMenu(
     },
     0,
   );
+  // ---------------------------------------------------------------- deer (deer.js)
+  // How many live in the world; a crossing by the next way across (a stretch and a side its route is clear from: the
+  // walker put there, the deer fired five seconds on, counted down here)
+  const DEER = [0, 1, 3];
+  row(
+    'Deer',
+    DEER.map((count) => `${count}`),
+    (index) => {
+      scene.debug.deerCount(DEER[index]);
+    },
+    DEER.indexOf(scene.debug.deerCount()),
+  );
+  let next = 0;
+  const countdown = document.createElement('p');
+  countdown.className = 'note';
+  row('Deer crossing', ['deer crossing'], () => {
+    const n = scene.debug.deerStretches().length;
+    const routes = scene.debug.deerRoutes();
+    if (!routes.length) {
+      countdown.textContent = 'no stretch where a deer may cross';
+      return false;
+    }
+    const [at, side] = routes[next++ % routes.length];
+    scene.debug.deerCross(at, 5, side as 1 | -1);
+    const tick = (): void => {
+      const left = scene.debug.deerIn();
+      countdown.textContent =
+        left > 0
+          ? `deer in ${Math.ceil(left)} (stretch ${at + 1} of ${n})`
+          : '';
+      if (left > 0) setTimeout(tick, 200);
+    };
+    tick();
+    return false;
+  });
+  panel.append(countdown);
+  // ---------------------------------------------------------------- (deer end)
   const RAVENS = [0, 1, 2];
   row(
     'Ravens',
@@ -168,25 +205,44 @@ export function attachDebugMenu(
     },
     COUNTS.indexOf(scene.debug.jays()),
   );
-  // the nearest of a kind, looked at from far enough off not to put it up
-  const KINDS = ['jay'];
+  // the nearest of a kind, looked at from far enough off not to put it up (metres away for each bird)
+  const KINDS = ['jay', 'raven', 'deer'];
+  const OFF = [7, 14];
   row('Nearest', KINDS, (index) => {
     const [fromX, , fromZ] = scene.debug.at();
     const far = (at: number[]): number =>
       Math.hypot(at[0] - fromX, at[2] - fromZ);
+    // deer (deer.js): the nearest path point with a view of a resting deer, looking at it
+    if (KINDS[index] === 'deer') {
+      const herd = scene.debug.deerState().slice(0, 3);
+      let best: number[] | null = null;
+      scene.debug.deerHomes().homes.forEach((home, i) => {
+        if (!herd[i]?.[4]) return;
+        for (const [x, z] of home[8] as number[][]) {
+          const d = far([x, 0, z]);
+          if (!best || d < best[0])
+            best = [d, x, z, herd[i][1] as number, herd[i][2] as number];
+        }
+      });
+      if (best) scene.debug.stand(best[1], best[2], best[3], best[4]);
+      return;
+    }
     const nearest = scene.debug
       .birds()
       .filter((bird) => bird.species === KINDS[index])
       .sort((first, second) => far(first.at) - far(second.at))[0];
     if (!nearest) return;
-    const [x, , z] = nearest.at;
+    const [x, y, z] = nearest.at;
     const away = far(nearest.at) || 1;
     scene.debug.stand(
-      x + ((fromX - x) / away) * 7,
-      z + ((fromZ - z) / away) * 7,
+      x + ((fromX - x) / away) * OFF[index],
+      z + ((fromZ - z) / away) * OFF[index],
       x,
       z,
     );
+    // (looked at where it is: a raven may be up on its snag)
+    const [eyeX, eyeY, eyeZ] = scene.debug.at();
+    scene.debug.look(eyeX, eyeY, eyeZ, x, y + 0.2, z);
   });
   row(
     'Quality (reloads)',
