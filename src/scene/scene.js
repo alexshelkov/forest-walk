@@ -92,7 +92,7 @@ import {
   W_SURF,
   W_WATER,
 } from './shaders.js';
-import { bake, creekAt, half16, probes, SN } from './water.js';
+import { alongStreams, bake, creekAt, half16, probes, SN } from './water.js';
 import {
   buildTerrain,
   heightAt,
@@ -115,8 +115,17 @@ import {
   trailD,
   trailHalf,
   trailK,
+  trailMake,
 } from './world.js';
-import { sound, soundPause, soundResume } from './audio.js';
+import {
+  setBank,
+  sound,
+  soundDebug,
+  soundFrame,
+  soundPause,
+  soundResume,
+} from './audio.js';
+import { bakeSounds, SURFACES } from './sounds.js';
 import { makeCreatures } from './creatures.js';
 import { makeDeer } from './deer.js';
 import {
@@ -135,7 +144,7 @@ import {
 // Switched off while the forest itself is being worked on. ANIMALS: the deer, fox, squirrels, owls and ducks of
 // creatures.js, the flocks and soaring birds, the fireflies. SOUND: the soundscape of audio.js
 const ANIMALS = false,
-  SOUND = false;
+  SOUND = true;
 // The weather. A state is what it brings, each 0 to 1: rain falling, the fog thickening, a storm overhead. The
 // walk opens in clear (the mist and low sun of FOG and MIST below) and drifts through DRIFT, a state for so many
 // seconds, round and round. Each value eases toward its state's by its own clock (step): the weather never
@@ -1523,7 +1532,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         const ix = floor((x + dx * t - OX) / VS / 2),
           iy = floor((y + 0.77 * t - OY) / VS / 2),
           iz = floor((z + dz * t - OZ) / VS / 2);
-        if (ix < 0 || iz < 0 || iy < 0 || ix >= NX / 2 || iz >= NZ / 2 || iy >= NY / 2) break;
+        if (
+          ix < 0 ||
+          iz < 0 ||
+          iy < 0 ||
+          ix >= NX / 2 ||
+          iz >= NZ / 2 ||
+          iy >= NY / 2
+        )
+          break;
         sum += Wd.crown[ix + (NX / 2) * (iy + (NY / 2) * iz)];
       }
       if (sum >= 120) veiled++;
@@ -1560,6 +1577,85 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   });
   let deerClock = 0;
   // ---------------------------------------------------------------- (deer end)
+  let shown = false; // (the loader gone: sound's idle work may begin)
+  // ---------------------------------------------------------------- sound (audio.js, sounds.js)
+  // The bank is baked here, in the load (soundMs: how long it took). soundProbe is what audio.js reads of the world:
+  // F, and what is underfoot, how closed the crowns are, how near the lake. The fallen leaves are kept from the
+  // ground map (its green, at half its size) before the map is let go
+  const soundFrom = performance.now();
+  setBank(bakeSounds());
+  const soundMs = performance.now() - soundFrom,
+    SOUND_W = NX * VS,
+    soundLit = new Uint8Array(256 * 256);
+  for (let j = 0; j < 256; j++)
+    for (let i = 0; i < 256; i++)
+      soundLit[i + 256 * j] = Wd.gm[(2 * i + 1024 * j) * 4 + 1];
+  const SURF = Object.fromEntries(SURFACES.map((name, k) => [name, k])),
+    soundStreams = [];
+  alongStreams((x, z, tx, tz, hw, lv, steep, lip) =>
+    soundStreams.push(x, z, hw, lip ? 1 : 0),
+  );
+  const soundProbe = {
+    F,
+    // What is underfoot at x, z (a SURFACES code): what crosses the water (planks, a log or two, stepping stones),
+    // the boardwalk and the dock, the water's edge, the path's make, and off it the clearings' grass, fallen leaves
+    // or the moss and needles of the woods
+    surface: (x, z) => {
+      for (const c of Wd.crossings) {
+        if (c.length < 11) continue;
+        const [x0, z0, x1, z1] = c.slice(6),
+          len = hypot(x1 - x0, z1 - z0),
+          along = ((x - x0) * (x1 - x0) + (z - z0) * (z1 - z0)) / len;
+        if (
+          along > -0.3 &&
+          along < len + 0.3 &&
+          abs(((z - z0) * (x1 - x0) - (x - x0) * (z1 - z0)) / len) < 0.9
+        )
+          return c[0] < 2 ? SURF.planks : c[0] < 4 ? SURF.log : SURF.stone;
+      }
+      const [px0, pz0, px1, pz1] = Wd.pier,
+        plen = hypot(px1 - px0, pz1 - pz0),
+        palong = ((x - px0) * (px1 - px0) + (z - pz0) * (pz1 - pz0)) / plen;
+      if (
+        palong > 0 &&
+        palong < plen &&
+        abs(((z - pz0) * (px1 - px0) - (x - px0) * (pz1 - pz0)) / plen) < 1.2
+      )
+        return SURF.boardwalk;
+      const k = trailK(x, z),
+        onPath = trailD(x, z) < trailHalf(k) + 0.3;
+      if (onPath && k >= BOARDWALK[0] && k <= BOARDWALK[1])
+        return SURF.boardwalk;
+      if (creekAt(x, z)[0] < 0.1 || lakeD(x, z) < 0.3) return SURF.water;
+      if (onPath)
+        return [SURF.gravel, SURF.dirt, SURF.leaves, SURF.grass][trailMake(k)];
+      if (OPEN.some((o) => hypot(x - o[0], z - o[1]) < o[2] - 1))
+        return SURF.grass;
+      const lit =
+        soundLit[
+          clamp(floor(((x + SOUND_W / 2) / SOUND_W) * 256), 0, 255) +
+            256 * clamp(floor(((z + SOUND_W / 2) / SOUND_W) * 256), 0, 255)
+        ];
+      return lit > 90 ? SURF.leaves : SURF.moss;
+    },
+    canopy: (x, z) => deerCanopy(x, z),
+    lake: (x, z) => clamp(1 - lakeD(x, z) / 15, 0, 1),
+    // the streams' samples: x, z, half width, 1 at a fall's lip
+    streams: soundStreams,
+    // metres to the lake's shore (0 on it or in it) and the way to it
+    shore: (x, z) => [
+      max(lakeD(x, z), 0),
+      lakeD(x - 0.5, z) - lakeD(x + 0.5, z),
+      lakeD(x, z - 0.5) - lakeD(x, z + 0.5),
+    ],
+    // the birds: species, place, what each is doing (birds.js)
+    birds: () => birds.list(),
+    // the way to the last flash, for its thunder's bearing (FL is made further down: read when asked)
+    get flash() {
+      return FL;
+    },
+  };
+  // ---------------------------------------------------------------- (sound end)
   let nV = 0,
     nI = 0;
   for (const m of meshes) {
@@ -3799,7 +3895,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       Q.writeBuffer(vbDeerBlot, 0, deer.blots);
     }
     render();
-    cpuMs += (performance.now() - cpu0 - cpuMs) * 0.05; // a running mean of what a frame costs this thread
+    const cpuNow = performance.now() - cpu0;
+    cpuMs += (cpuNow - cpuMs) * 0.05; // a running mean of what a frame costs this thread
+    // sound (audio.js): its idle work posted after the frame, once the forest is shown
+    if (SOUND && (shown || (shown = document.body.dataset.state === 'ready')))
+      soundFrame(cpuNow);
     // frames 30 and 300: a picture with no light in it is a failure that raises no error. Only twice: each look
     // waits for the GPU, a hitch on a phone
     frames++;
@@ -4127,9 +4227,53 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       deerWalkTest: (seconds, odds) => deer.walkTest(seconds, odds),
       deerHomes: () => deer.homeList(),
       // ---------------------------------------------------------------- (deer end)
+      // ---------------------------------------------------------------- sound (audio.js)
+      soundMaster: (v) => soundDebug.master(v),
+      soundOn: (type, v) => soundDebug.type(type, v),
+      soundLevel: (type, db) => soundDebug.level(type, db),
+      soundLevels: () => soundDebug.levels(),
+      soundStepOn: (surface, wet) => soundDebug.stepOn(surface, wet),
+      soundState: () => [...soundDebug.state(), +soundMs.toFixed(1)],
+      soundHere: () => SURFACES[soundProbe.surface(F[CX], F[CZ])],
+      soundThunder: (km) => soundDebug.thunderNow(km),
+      soundCall: (species, d) => soundDebug.callNow(species, d),
+      soundWater: () => soundDebug.water(),
+      soundReduction: () => soundDebug.reduction(),
+      soundRender: async (
+        secs,
+        state,
+        v,
+        surface,
+        canopy,
+        lake,
+        solo,
+        flashes,
+        water,
+        birdsHeard,
+      ) => {
+        const F2 = new Float64Array(F.length);
+        F2.set(F);
+        for (const [k, val] of Object.entries(state || {})) F2[+k] = val;
+        const x = await soundDebug.render(
+          secs,
+          F2,
+          v,
+          SURFACES.indexOf(surface),
+          canopy,
+          lake,
+          solo,
+          flashes,
+          water,
+          birdsHeard,
+        );
+        return Array.from(x, (s) => Math.round(s * 32767));
+      },
+      // ---------------------------------------------------------------- (sound end)
     },
+    // (sound: only once the forest is shown, the loader gone)
     wake: () => {
-      if (raf && SOUND) sound(F);
+      if (raf && SOUND && document.body.dataset.state === 'ready')
+        sound(soundProbe);
     },
   };
 }

@@ -24,6 +24,7 @@ const MAKES = [
   'stepping stones',
 ];
 const BEFORE = 2; // a crossing is looked along from this many metres before its near end
+const SOUND_KEY = 'forestSound'; // each sound type's [on, dB offset], kept by the menu
 
 // (#stats makes room for the button; plain insets: a tik's safe area is outside its frame)
 const CSS = `
@@ -43,6 +44,8 @@ const CSS = `
 #debug .row button { min-height: 30px; padding: 4px 9px; border-radius: 8px; background: #ffffff1f; }
 #debug .row button[aria-pressed='true'] { background: #ffc24a; color: #120a05; }
 #debug .note { margin: 6px 0 0; font-weight: 400; opacity: 0.8; }
+#debug .row.mix { display: grid; grid-template-columns: 1fr 30px 48px 30px; align-items: center; margin-bottom: 4px; }
+#debug .mix span { text-align: center; font-variant-numeric: tabular-nums; }
 #stats { right: 64px; }
 `;
 
@@ -187,6 +190,130 @@ export function attachDebugMenu(
   });
   panel.append(countdown);
   // ---------------------------------------------------------------- (deer end)
+  // ---------------------------------------------------------------- sound (audio.js)
+  // (each starts the sound first if it has not started: a press in the menu is a touch too) On or off; four steps
+  // on a surface, dry or wet
+  const SURFACE = [
+    'gravel',
+    'dirt',
+    'leaves',
+    'grass',
+    'moss',
+    'planks',
+    'boardwalk',
+    'log',
+    'stone',
+    'water',
+  ];
+  let wetSteps = 0;
+  row(
+    'Sound',
+    ['on', 'wet steps'],
+    (index) => {
+      scene.wake();
+      if (index === 0)
+        return scene.debug.soundMaster(!scene.debug.soundMaster());
+      wetSteps = 1 - wetSteps;
+      return wetSteps === 1;
+    },
+    0,
+  );
+  // One line per type of sound: on or off, and its level 3 dB a press; kept across reloads (this menu is dev only)
+  const savedMix = ((): Record<string, [boolean, number]> => {
+    try {
+      return JSON.parse(localStorage.getItem(SOUND_KEY) ?? '{}');
+    } catch {
+      return {};
+    }
+  })();
+  const keepMix = (): void => {
+    const all = scene.debug
+      .soundLevels()
+      .map(([name, on, dB]) => [name, [on, dB]]);
+    try {
+      localStorage.setItem(SOUND_KEY, JSON.stringify(Object.fromEntries(all)));
+    } catch {
+      // storage is blocked: the mix holds for this load only
+    }
+  };
+  const mixHeading = document.createElement('h2');
+  mixHeading.textContent = 'Sound types';
+  panel.append(mixHeading);
+  const shows: (() => void)[] = [];
+  const control = (text: string, act: () => void): HTMLButtonElement => {
+    const button = document.createElement('button');
+    button.textContent = text;
+    button.addEventListener('click', () => {
+      scene.wake();
+      act();
+      keepMix();
+      for (const show of shows) show();
+      button.blur();
+    });
+    return button;
+  };
+  for (const [name] of scene.debug.soundLevels()) {
+    const [on, dB] = savedMix[name] ?? [true, 0];
+    scene.debug.soundOn(name, on);
+    scene.debug.soundLevel(name, dB);
+    const line = document.createElement('div');
+    line.className = 'row mix';
+    const toggle = control(name, () =>
+      scene.debug.soundOn(name, !scene.debug.soundOn(name)),
+    );
+    const level = document.createElement('span');
+    const step = (by: number): void => {
+      scene.debug.soundLevel(name, scene.debug.soundLevel(name) + by);
+    };
+    line.append(
+      toggle,
+      control('-', () => step(-3)),
+      level,
+      control('+', () => step(3)),
+    );
+    shows.push(() => {
+      const offset = scene.debug.soundLevel(name);
+      toggle.setAttribute('aria-pressed', `${scene.debug.soundOn(name)}`);
+      level.textContent = `${offset > 0 ? '+' : ''}${offset} dB`;
+    });
+    panel.append(line);
+  }
+  for (const show of shows) show();
+  const levelList = document.createElement('p');
+  levelList.className = 'note';
+  row('Sound mix', ['all on', 'all off', 'reset', 'show levels'], (index) => {
+    scene.wake();
+    const levels = scene.debug.soundLevels();
+    for (const [name] of levels) {
+      if (index < 2) scene.debug.soundOn(name, index === 0);
+      if (index === 2) {
+        scene.debug.soundOn(name, true);
+        scene.debug.soundLevel(name, 0);
+      }
+    }
+    if (index === 3) {
+      levelList.textContent = levels
+        .map(([name, on, dB]) => `${name} ${dB} dB${on ? '' : ' (off)'}`)
+        .join(', ');
+      console.log('sound levels', levels);
+    }
+    keepMix();
+    for (const show of shows) show();
+  });
+  panel.append(levelList);
+  row('Step on', SURFACE, (index) => {
+    scene.wake();
+    scene.debug.soundStepOn(SURFACE[index], wetSteps);
+  });
+  row('Thunder now', ['near', 'far'], (index) => {
+    scene.wake();
+    scene.debug.soundThunder(index ? 5 : 1.2);
+  });
+  row('Call now', ['jay', 'raven'], (index) => {
+    scene.wake();
+    scene.debug.soundCall(index ? 'raven' : 'jay', 20);
+  });
+  // ---------------------------------------------------------------- (sound end)
   const RAVENS = [0, 1, 2];
   row(
     'Ravens',

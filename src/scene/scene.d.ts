@@ -232,6 +232,47 @@ export interface Scene {
     /** The homes of the deer at rest: x, z, yaw, metres to the nearest path, the path point it is seen nearest from (x, z), how far that is, 1 at the meadow's edge, every path point it is seen from; and the ms the search took. */
     deerHomes(): { ms: number; homes: (number | number[][])[][] };
     // ---------------------------------------------------------------- (deer end)
+    // ---------------------------------------------------------------- sound (audio.js)
+    /** All the sound on or off (it fades); returns whether it is on. */
+    soundMaster(on?: boolean): boolean;
+    /** A type of sound on or off (steps, rain, drips, wind, thunder, brook, creek, falls, lake, jays, ravens); returns whether it is on. */
+    soundOn(type: string, on?: boolean): boolean;
+    /** A type's level offset in dB (-30 to 12); returns it. */
+    soundLevel(type: string, dB?: number): number;
+    /** Each type: its name, on, level offset in dB, and its gain node's value now (null before the first touch). */
+    soundLevels(): [string, boolean, number, number | null][];
+    /** Four steps on a surface now (gravel, dirt, leaves, grass, moss, planks, boardwalk, log, stone, water), wet 0 or 1. */
+    soundStepOn(surface: string, wet?: number): number;
+    /** The context's state, steps and bird calls played, the timer's ticks and their mean and longest ms, the bank's MB, the idle slices with their total and longest ms and the seconds from the first slice to the bank done, the ms the load's bake took. */
+    soundState(): (string | number)[];
+    /** What is underfoot where the walker stands. */
+    soundHere(): string;
+    /**
+     * Renders `secs` of the mix offline (mono, 22050 a second, 16-bit values): frame state slots set from `state`
+     * (slot: value), a walk at v m/s on `surface`, the crowns' cover and the lake's nearness; `solo` the types heard
+     * (a comma list; none: all).
+     */
+    soundRender(
+      secs: number,
+      state: Record<number, number>,
+      v: number,
+      surface: string,
+      canopy?: number,
+      lake?: number,
+      solo?: string,
+      flashes?: number[][],
+      water?: { streams?: number[]; shore?: number[] },
+      birds?: { species: string; at: number[]; state: string }[],
+    ): Promise<number[]>;
+    /** A bird's call now, d m off, straight ahead (jay or raven). */
+    soundCall(species: string, d: number): number;
+    /** The limiter's gain reduction in dB (0 while it is idle): now, and the deepest in the last soundRender. */
+    soundReduction(): number[];
+    /** The water round the walker: each emitter's name, metres off, level and pan. */
+    soundWater(): (string | number)[][];
+    /** Thunder now, km off, straight ahead. */
+    soundThunder(km: number): number;
+    // ---------------------------------------------------------------- (sound end)
     /**
      * Holds the render size at about n pixels (the frame-time tuner left off), or lets the tuner go again (0).
      * Returns the size now.
