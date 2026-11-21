@@ -1,0 +1,9 @@
+node_modules
+dist
+.vite
+
+# A build artifact of the module, regenerated from the live schema on every
+# sync: never hand-edited, and not worth a diff. The spacetime project files and
+# `backend/src/tik-backend.ts` are generated too, but they stay in the repo,
+# since your module imports the guard and a reader should see what it does.
+module_bindings

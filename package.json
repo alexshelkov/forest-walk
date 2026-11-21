@@ -1,0 +1,11 @@
+{
+  "name": "tik",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "codetik dev",
+    "build": "codetik build",
+    "check": "codetik check"
+  }
+}
