@@ -1,13 +1,17 @@
-// The debug menu of a dev machine (main.ts attaches it only there): a button in the top right corner that opens
-// a panel of switches over the scene's debug API. Its styles travel with it, so a published page carries none.
-import { MEDIUM, WHY } from './scene/quality.js';
+// The testing menu, in every build but hidden by default (users never see it): four quick taps in the top right
+// corner show or hide it (main.ts).
+// A button in that corner opens a panel of switches over the scene's debug API; its first row switches the budget
+// view (budget.ts). The panel scrolls where it is longer than the screen. Its styles travel with it.
+import type { BudgetView } from './budget';
+import { TIER, tryTier, WHY } from './scene/quality.js';
 import type { Scene } from './scene/scene.js';
+import { VERSION } from './version';
 
 type Weather = 'auto' | 'clear' | 'fog' | 'rain' | 'storm';
 
 const WEATHERS: Weather[] = ['auto', 'clear', 'fog', 'rain', 'storm'];
 const FLASHES = ['patch', 'sheet', 'bolt']; // the kinds of scene.debug.flash, in its order
-const LEVELS = ['Low', 'Medium']; // quality.js: the pick is kept as forestLevel
+const LEVELS = ['High', 'Medium', 'Low']; // quality.js TIERS; picked as the Try knob picks (tryTier)
 // a place: a point of the trail and how many points ahead to look (scene.debug.trail)
 const PLACES: [string, number, number][] = [
   ['start', 0, 10],
@@ -37,8 +41,9 @@ const CSS = `
 #debug button { border: 0; color: inherit; font: inherit; touch-action: manipulation; }
 #debug .open { display: grid; place-items: center; width: 44px; height: 44px; background: none;
   color: #ffffff94; filter: drop-shadow(0 0 3px #120a0540); }
-#debug .panel { display: none; width: 216px; padding: 10px; overflow: auto; border-radius: 12px;
-  background: #120a05e6; box-shadow: 0 0 0 1px #ffe9bf40; font: 600 12px/1.3 system-ui, sans-serif; }
+#debug .panel { display: none; width: 216px; min-height: 0; padding: 10px; overflow-y: auto;
+  overscroll-behavior: contain; touch-action: pan-y; border-radius: 12px; background: #120a05e6;
+  box-shadow: 0 0 0 1px #ffe9bf40; font: 600 12px/1.3 system-ui, sans-serif; }
 #debug.is-open .panel { display: block; }
 #debug h2 { margin: 8px 0 4px; font: inherit; font-size: 10px; letter-spacing: 0.1em;
   text-transform: uppercase; opacity: 0.6; }
@@ -55,11 +60,18 @@ const CSS = `
 export interface DebugMenu {
   /** Shows the menu, or hides it altogether (for clean stills). */
   show(on: boolean): void;
+  /** Opens its panel. */
+  open(): void;
+  /** Whether it shows. */
+  shown(): boolean;
 }
 
+// view: the budget view its first row switches; hide: what its "hide menu" button does (main.ts)
 export function attachDebugMenu(
   scene: Scene,
   toggleStats: () => boolean,
+  view: BudgetView | null,
+  hide: () => void,
 ): DebugMenu {
   const style = document.createElement('style');
   style.textContent = CSS;
@@ -110,6 +122,16 @@ export function attachDebugMenu(
     panel.append(heading, buttons);
   };
 
+  row(
+    `Testing · v${VERSION}`,
+    ['debug view', 'hide menu'],
+    (index) => {
+      if (index === 0) return view ? view.show(!view.show()) : false;
+      hide();
+      return false;
+    },
+    view?.show() ? 0 : -1,
+  );
   row('Weather', WEATHERS, (index) => scene.debug.weather(WEATHERS[index]), 0);
   row('Lightning', FLASHES, (index) => {
     scene.debug.flash(index);
@@ -221,7 +243,7 @@ export function attachDebugMenu(
     },
     0,
   );
-  // One line per type of sound: on or off, and its level 3 dB a press; kept across reloads (this menu is dev only)
+  // One line per type of sound: on or off, and its level 3 dB a press; kept across reloads on this device
   const savedMix = ((): Record<string, [boolean, number]> => {
     try {
       return JSON.parse(localStorage.getItem(SOUND_KEY) ?? '{}');
@@ -374,23 +396,20 @@ export function attachDebugMenu(
     const [eyeX, eyeY, eyeZ] = scene.debug.at();
     scene.debug.look(eyeX, eyeY, eyeZ, x, y + 0.2, z);
   });
+  // (auto: back to the tier chosen as usual)
   row(
-    'Quality (reloads)',
-    LEVELS,
+    'Tier (reloads)',
+    [...LEVELS, 'auto'],
     (index) => {
-      try {
-        localStorage.setItem('forestLevel', LEVELS[index]);
-      } catch {
-        return; // storage is blocked: the level cannot be kept, so a reload would change nothing
-      }
+      tryTier(LEVELS[index] ?? '');
       location.reload();
     },
-    MEDIUM ? 1 : 0,
+    WHY === 'Try knob' ? LEVELS.indexOf(TIER) : LEVELS.length,
   );
   row('Show', ['stats line'], toggleStats, 1);
   const level = document.createElement('p');
   level.className = 'note';
-  level.textContent = `Running ${MEDIUM ? 'Medium' : 'Low'} (${WHY})`;
+  level.textContent = `Running ${TIER} (${WHY})`;
   panel.append(level);
   row(
     'Exposure',
@@ -400,7 +419,6 @@ export function attachDebugMenu(
     },
     scene.debug.exposure(),
   );
-  // (animals and sound get their rows here when those phases land)
 
   open.addEventListener('click', () => {
     root.classList.toggle('is-open');
@@ -412,5 +430,9 @@ export function attachDebugMenu(
     show(on) {
       root.style.display = on ? '' : 'none';
     },
+    open() {
+      root.classList.add('is-open');
+    },
+    shown: () => root.style.display !== 'none',
   };
 }

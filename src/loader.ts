@@ -1,38 +1,33 @@
-// The loading screen's painting, revealed in steps over the load: from the start its sky and its land as flat
+// The loading screen's painting, revealed in steps with the progress bar: from the start its sky and its land as flat
 // silhouettes, then the land's flat colours, the painting itself, and a warm light in the mist. Every picture of the
 // loader, the logo's too, is a cell of one sprite sheet (public/assets/loader/loader.webp; its cells are cut out in
-// index.html), so they all arrive together. Each step is one long Web Animation of opacity on one full-screen layer
-// (#art's), all made when the load begins (begin(), main.ts) and timed as shares of how long the last load took
-// here, so the finished painting stands for the last quarter; made at once while the thread is still free, they run
-// on the compositor through the build with nothing more asked of it. Once a layer is in, the one under it is hidden.
+// index.html), so they all arrive together. Each step is one Web Animation of opacity on one full-screen layer
+// (#art's), made as the bar sets out for that step's share (reach, from main.ts say at each stage's start) and as
+// long as the bar's glide there: made while the thread is still free, it runs on the compositor through the build, as
+// the bar does. Once a layer is in, the one under it is hidden.
 
 export const SHEET = '/assets/loader/loader.webp';
 
-// the pictures over the silhouettes: the share of the load where each begins to come in, and where it is in
-const STEPS: [string, number, number][] = [
-  ['colour', 0.03, 0.24],
-  ['detail', 0.25, 0.5],
-  ['light', 0.5, 0.75],
+// the pictures over the silhouettes, and the bar's share each comes in with: the stages that take the bar there
+// (scene.js: Raising the hills, Growing the forest, Building bridges), so the whole painting stands through the last
+const STEPS: [string, number][] = [
+  ['colour', 0.25],
+  ['detail', 0.73],
+  ['light', 0.94],
 ];
-const LENGTH_KEY = 'forestLoadMs'; // how long the last load took here, from its beginning to the forest shown
-const FIRST_MS = 7000; // a first visit's guess at its load's length
-const LENGTH_MS = [3000, 15000]; // what a kept length is held within (a load paused off screen must not count)
+const MIN_FADE_MS = 1200; // a fade lasts as long as the bar's glide, at least this
 
 export interface Reveal {
-  /** The load begins: every step is timed now, from how long the last load took. */
-  begin(): void;
-  /** The load reaches its last stage: a step not yet begun begins now, so all are seen. */
-  last(): void;
-  /** The forest is shown: this load's length is kept for the next. */
-  done(): void;
+  /** The bar sets out for `to` (0 to 1) over `ms`: each step whose share it reaches comes in now, over as long (a
+   * skipped stage's step at once with the next; at the end, all). */
+  reach(to: number, ms: number): void;
   /** Shows every step up to `upTo` (0 to 1) at once (the dev build's held loader). */
   show(upTo: number): void;
 }
 
 interface Step {
   layer: HTMLElement;
-  from: number;
-  to: number;
+  share: number;
   covers: HTMLElement | null; // (hidden once this is in; the light covers nothing)
 }
 
@@ -47,70 +42,40 @@ export function decodeSheet(): Promise<void> {
 export function attachReveal(art: HTMLElement): Reveal {
   const layer = (kind: string): HTMLElement => art.querySelector(`.${kind}`)!;
   let below = layer('shapes');
-  const steps: Step[] = STEPS.map(([kind, from, to]) => {
+  const steps: Step[] = STEPS.map(([kind, share]) => {
     const step = {
       layer: layer(kind),
-      from,
-      to,
+      share,
       covers: kind === 'light' ? null : below,
     };
     below = step.layer;
     return step;
   });
   const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const fades: Animation[] = [];
-  let began = 0;
+  let next = 0; // the first step not yet begun
   return {
-    begin() {
-      if (began) return;
-      began = performance.now();
-      let length = FIRST_MS;
-      try {
-        length = Number(localStorage.getItem(LENGTH_KEY)) || FIRST_MS;
-      } catch {
-        // storage is blocked: the first visit's guess
-      }
-      length = Math.min(Math.max(length, LENGTH_MS[0]), LENGTH_MS[1]);
-      for (const { layer: element, from, to, covers } of steps) {
-        // (reduced motion: the step simply switches on where it would have been in)
+    reach(to, ms) {
+      for (
+        ;
+        next < steps.length && (steps[next].share <= to || to >= 1);
+        next++
+      ) {
+        const { layer: element, covers } = steps[next];
+        // (reduced motion: the step simply switches on)
         const fade = element.animate([{ opacity: 0 }, { opacity: 1 }], {
-          duration: still ? 1 : (to - from) * length,
-          delay: (still ? to : from) * length,
+          duration: still ? 1 : Math.max(ms, MIN_FADE_MS),
           fill: 'both',
           easing: 'ease-in-out',
         });
-        fades.push(fade);
         if (covers)
           fade.finished
             .then(() => (covers.style.visibility = 'hidden'))
             .catch(() => {});
       }
     },
-    last() {
-      // (one not begun yet begins now: its wait ends at the time it has reached)
-      for (const fade of fades)
-        if (fade.playState !== 'finished')
-          fade.effect?.updateTiming({
-            delay: Math.min(
-              Number(fade.currentTime) || 0,
-              Number(fade.effect.getTiming().delay) || 0,
-            ),
-          });
-    },
-    done() {
-      if (!began) return;
-      try {
-        localStorage.setItem(
-          LENGTH_KEY,
-          `${Math.round(performance.now() - began)}`,
-        );
-      } catch {
-        // storage is blocked: the next load guesses
-      }
-    },
     show(upTo) {
-      for (const { layer: element, to, covers } of steps)
-        if (to <= upTo) {
+      for (const { layer: element, share, covers } of steps)
+        if (share <= upTo) {
           element.style.opacity = '1';
           if (covers) covers.style.visibility = 'hidden';
         }

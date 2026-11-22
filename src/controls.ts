@@ -1,5 +1,7 @@
 // Touch controls: the bottom left corner (#walk, a --walk-zone square in index.html) walks while held, shown or
 // not; a drag anywhere else turns the view. Each gets its own finger, so one thumb can walk while the other steers.
+// onTouch (the sound's wake) runs on a touch's start and on its end: iOS lets sound start only in a touch's end
+// (pointerup, touchend), with click as a fallback.
 import type { SceneInput } from './scene/scene.js';
 
 // A hidden tuning gesture: SECRET_TAPS taps within SECRET_MS in the top right SECRET_PX square.
@@ -72,6 +74,9 @@ export function attachControls(
   const endLook = (event: PointerEvent): void => {
     if (event.pointerId === lookPointer) lookPointer = null;
   };
+  for (const element of [stage, walkButton])
+    for (const kind of ['pointerup', 'touchend', 'click'])
+      element.addEventListener(kind, onTouch, { passive: true });
   stage.addEventListener('pointerup', endLook);
   stage.addEventListener('pointercancel', endLook);
   stage.addEventListener('lostpointercapture', endLook);

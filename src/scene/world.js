@@ -1,4 +1,8 @@
-import { MEDIUM, NEAR_D, THIN } from './quality.js';
+// The world's layout and everything placed in it, made once at load on the CPU: the trail and side paths, the
+// terrain's shape (buildTerrain, trailField), every tree, plant, rock and piece of woodwork (makeWorld, as instance
+// stores sorted by culling cell), and the procedural meshes. scene.js calls it. Each part seeds the random stream
+// (rseed): a part that draws more or fewer numbers moves everything drawn after it up to the next rseed.
+import { HIGH, NEAR_D, THIN } from './quality.js';
 import {
   abs,
   atan2,
@@ -520,8 +524,8 @@ export function makeWorld(D, T) {
     fall: [],
     sign: [],
   };
-  // Medium and Low keep one firefly and pebble in 2 / 4 (picked by a hash, so the random stream stays the same).
-  // Leaves are all kept on every level: the fog ends the view early instead, and what is near is what is looked at
+  // High keeps one pebble in 2, Medium and Low one in 4 (THIN; picked by a hash, so the random stream stays the same).
+  // Leaves are all kept on every tier: the fog ends the view early instead, and what is near is what is looked at
   let nth = 0;
   const kept = (thin = THIN) => ihash(nth++, 3, 5) * thin < 1;
   // a ribbon leaf (W_LEAF): root, length, yaw, tilt from upright, width, height up its plant, type, tree hue, seed, bend
@@ -557,7 +561,6 @@ export function makeWorld(D, T) {
         bend,
       );
   };
-  const glints = [];
   const solids = []; // per mesh id: arrays of 12 floats
   const props = Array.from({ length: NTRUNK }, () =>
     Array.from({ length: nCells }, () => []),
@@ -615,8 +618,7 @@ export function makeWorld(D, T) {
     ] += wide / (OCW * OCW);
   };
   const trees = [],
-    snags = [],
-    litter = []; // big conifers (for the squirrels), dead trunks (for the owls), leaf fall
+    litter = []; // trees: the big trunks (debug.near 'trunk'); litter: x, z, radius where a broadleaf drops its leaves
 
   // --- where things grow
   const MEADOW = OPEN[0],
@@ -1045,17 +1047,25 @@ export function makeWorld(D, T) {
           0.45,
         ]);
       }
+      // A card's root lies on its limb or fork, never past the tip, so its tufts' twigs meet on wood (W_LEAF limbPF).
+      // Its jitter is drawn as before (y, the length, x, z: the random stream stays the same) but moves it only along
+      // the line
       for (let i = Math.ceil(n / nl); i > 0; i--) {
         const e = ends[i % 2],
           t = rr(e[6], 1.05),
           o = ll * 0.1,
-          py = e[1] + e[4] * t + rr(-o, o),
-          L = rr(1.2, 2.1) * (kind === 3 ? 0.75 : 1);
+          jy = rr(-o, o),
+          L = rr(1.2, 2.1) * (kind === 3 ? 0.75 : 1),
+          jx = rr(-o, o),
+          jz = rr(-o, o),
+          along = (jx * e[3] + jy * e[4] + jz * e[5]) / (e[3] * e[3] + e[4] * e[4] + e[5] * e[5]),
+          on = clamp(t + along, e[6], 1),
+          py = e[1] + e[4] * on;
         leaf(
           big,
-          e[0] + e[3] * t + rr(-o, o),
+          e[0] + e[3] * on,
           py,
-          e[2] + e[5] * t + rr(-o, o),
+          e[2] + e[5] * on,
           L,
           az + rr(-0.7, 0.7),
           clamp(
@@ -1104,7 +1114,6 @@ export function makeWorld(D, T) {
     solid(9, x, y - 0.3, z, h, tipped(lean()), 2, 5 + rnd() * 0.99);
     blocks.push(x, z, h * 0.05 + 0.2);
     screen(x, z, h * 0.1);
-    snags.push({ x, y: y - 0.3, z, h });
   };
   // A young hemlock of the understory: a pole's trunk and flat lacy sprays in tiers almost to the ground. With the
   // bushes these fill the space between the big trunks, which is what makes a forest read as dense
@@ -1472,7 +1481,7 @@ export function makeWorld(D, T) {
         rr(0.22, 0.6) * tall,
         rnd() * TAU,
         rr(0.05, 0.6),
-        rr(0.035, 0.06) * (MEDIUM ? 1 : 1.5),
+        rr(0.035, 0.06) * (HIGH ? 1 : 1.5),
         0,
         4,
         rnd(),
@@ -1480,9 +1489,9 @@ export function makeWorld(D, T) {
         rr(0.3, 0.6),
       );
   };
-  // (half as many tufts on Low, of wider blades: a meadow in view is otherwise the most triangles of any place)
+  // (half as many tufts below High, of wider blades: a meadow in view is otherwise the most triangles of any place)
   for (const p of [MEADOW, ...GLADES])
-    for (let i = p[2] * p[2] * PI * (MEDIUM ? 14 : 7); i > 0; i--) {
+    for (let i = p[2] * p[2] * PI * (HIGH ? 14 : 7); i > 0; i--) {
       const a = rnd() * TAU,
         r = sqrt(rnd()) * p[2],
         x = p[0] + cos(a) * r,
@@ -1618,7 +1627,7 @@ export function makeWorld(D, T) {
       q = qRand(),
       sd = rnd();
     if (y > -0.5 && kept())
-      chunk(6, x, y - sc * 0.25, z, sc, q, 1, sd, MEDIUM ? 24 : 12);
+      chunk(6, x, y - sc * 0.25, z, sc, q, 1, sd, HIGH ? 24 : 12);
   }; // (they shrink away by where scene.js stops drawing them: PEBBLE)
   const shrooms = (x, z, n, R) => {
     const sd = rnd();
@@ -1636,7 +1645,7 @@ export function makeWorld(D, T) {
           qAxis(rr(-0.2, 0.2), 1, rr(-0.2, 0.2), rnd() * TAU),
           4,
           sd + rr(-0.004, 0.004),
-          MEDIUM ? 96 : 48,
+          HIGH ? 96 : 48,
         );
     }
   };
@@ -1863,7 +1872,7 @@ export function makeWorld(D, T) {
       q,
       1,
       rnd(),
-      large ? 0 : MEDIUM ? 96 : 48,
+      large ? 0 : HIGH ? 96 : 48,
     );
   }
   rseed(11); // pebbles: the trail's gravel, the creek's bed
@@ -1931,17 +1940,7 @@ export function makeWorld(D, T) {
         solid(0, px, y - sc * 0.15, pz, sc, qRand(), 1, rnd(), 1, 0);
         if (sc > 0.7) blocks.push(px, pz, sc * 0.7);
       } else
-        chunk(
-          0,
-          px,
-          y - sc * 0.08,
-          pz,
-          sc,
-          qRand(),
-          1,
-          rnd(),
-          MEDIUM ? 96 : 48,
-        );
+        chunk(0, px, y - sc * 0.08, pz, sc, qRand(), 1, rnd(), HIGH ? 96 : 48);
     };
     for (let j = steep > 0.12 ? 2 : 1; j > 0; j--)
       if (rnd() < (steep > 0.12 ? 0.5 : 0.25))
@@ -2009,17 +2008,7 @@ export function makeWorld(D, T) {
             !Number.isFinite(levelAt(fx, fz))
           )
             continue;
-          chunk(
-            0,
-            sx,
-            here - sc * 0.2,
-            sz,
-            sc,
-            turn,
-            1,
-            own(),
-            MEDIUM ? 96 : 48,
-          );
+          chunk(0, sx, here - sc * 0.2, sz, sc, turn, 1, own(), HIGH ? 96 : 48);
           foam[at] = much;
         }
         for (const across of [-0.5, 0, 0.5]) {
@@ -2076,7 +2065,7 @@ export function makeWorld(D, T) {
             qRand(),
             1,
             rnd(),
-            MEDIUM ? 96 : 48,
+            HIGH ? 96 : 48,
           );
         }
     }
@@ -2174,78 +2163,11 @@ export function makeWorld(D, T) {
     if (u > 0.6 && ld < 2.5) pebble(x, z);
   }
 
-  // --- fireflies: x, y, z, height (for the sway), seed, colour, size, 0
-  rseed(12);
-  for (let i = 0; i < 5200; i++) {
-    const a = rnd() * TAU,
-      r = sqrt(rnd()) * 165,
-      x = cos(a) * r,
-      z = sin(a) * r,
-      y = gy(x, z),
-      u = rnd();
-    if (
-      y > 0.2 &&
-      u <
-        max(
-          sstep(9, 0, creekAt(x, z)[0]),
-          openAt(x, z) * 0.6,
-          sstep(8, 1, lakeD(x, z)) * 0.8,
-          0.12,
-        ) &&
-      kept()
-    )
-      glints.push(x, y + rr(0.3, 2.4), z, 1, rnd(), rnd(), rr(0.012, 0.03), 0);
-  }
-
-  // --- flocks (W_ANIM vsFish) and soaring birds (vsManta)
-  const fish = [],
-    schools = []; // schools: one range of the buffer each, for culling
+  // (the 232 draws of the flocks that were here: the dust and rain below keep the places they had)
   rseed(14);
-  // A flock: x, z, metres over the ground, radius of its lap, count, size (m), speed and way round (1 = 1.9 m/s), seed,
-  // mesh (0 butterfly, 1 small bird). The seed's twelfth picks the colours (fsFish), 1 or more gives each its own
-  const SCH = [
-    [-4, 78, 2.2, 13, 46, 0.11, 0.25, 1.3, 0],
-    [-10, 84, 2, 7, 20, 0.1, -0.2, 0.02, 0],
-    [34, -46, 2.2, 6, 22, 0.1, 0.22, 0.27, 0],
-    [-58, 24, 2.1, 6, 18, 0.11, -0.2, 0.1, 0],
-    [58, 2, 2, 6, 16, 0.1, 0.2, 1.6, 0],
-    [-50, 74, 2.3, 5, 14, 0.1, -0.2, 0.19, 0],
-    [10, -4, 2.2, 5, 12, 0.11, 0.2, 1.1, 0],
-    [-18, 22, 2, 5, 14, 0.1, 0.2, 0.19, 0],
-    [-4, 76, 9, 24, 16, 0.26, 1.6, 0.02, 1],
-    [30, -30, 12, 26, 14, 0.26, -1.5, 0.1, 1],
-    [-46, 78, 10, 20, 12, 0.24, 1.4, 0.19, 1],
-    [60, 40, 6, 30, 18, 0.26, 1.7, 0.27, 1],
-    [-70, -30, 12, 22, 10, 0.25, -1.4, 0.1, 1],
-  ];
-  for (const s of SCH) {
-    const y = gy(s[0], s[1]) + s[2];
-    schools.push({
-      first: fish.length / 8,
-      count: s[4],
-      x: s[0],
-      y,
-      z: s[1],
-      r: s[3],
-      size: s[5],
-      kind: s[8],
-    });
-    for (let i = 0; i < s[4]; i++)
-      fish.push(s[0], y, s[1], s[3], rnd(), (s[6] * 1.9) / s[3], s[5], s[7]);
-  }
-  // big birds: the centre of the lap x, y, z, its radius, where on it they start, turn rate, size (half the wingspan), seed
-  const mantas = [];
-  for (const m of [
-    [62, 34, 50, 42, 0.3, 0.07, 1.1, 0.8],
-    [-4, 44, 78, 34, 2.2, -0.06, 0.7, 0.2],
-    [0, 52, 0, 80, 4.2, 0.035, 1.2, 0.7],
-    [-60, 46, -40, 46, 5, -0.05, 0.7, 0.3],
-    [40, 48, -40, 50, 1.2, 0.05, 0.7, 0.4],
-    [80, 30, 60, 26, 3, 0.09, 0.6, 0.1],
-  ])
-    mantas.push(...m);
+  for (let i = 0; i < 232; i++) rnd();
   // random vec4s for the dust, the rain and the falling leaves (W_SPR)
-  const snow = new Float32Array((MEDIUM ? 7000 : 3500) * 4);
+  const snow = new Float32Array((HIGH ? 7000 : 3500) * 4);
   for (let i = 0; i < snow.length; i++) snow[i] = rnd();
 
   // --- pack leaves (36 bytes: 8 floats + 4 unorm8), sorted by culling cell
@@ -3556,34 +3478,6 @@ export function makeWorld(D, T) {
     }
     return { data, n, start, sub, lo, hi };
   };
-  // fireflies (8 floats each) sorted by culling cell
-  const packG = () => {
-    const n = glints.length / 8,
-      start = new Uint32Array(nCells + 1),
-      sub = new Uint32Array(nCells * NSUB + 1),
-      key = new Uint16Array(n);
-    const lo = new Float32Array(nCells).fill(1e9),
-      hi = new Float32Array(nCells).fill(-1e9);
-    for (let i = 0; i < n; i++) {
-      const x = glints[i * 8],
-        y = glints[i * 8 + 1],
-        z = glints[i * 8 + 2],
-        c = cellOf(x, z);
-      key[i] = c * NSUB + subOf(x, z);
-      sub[key[i] + 1]++;
-      if (y - 1 < lo[c]) lo[c] = y - 1;
-      if (y + 1 > hi[c]) hi[c] = y + 1;
-    }
-    for (let k = 0; k < nCells * NSUB; k++) sub[k + 1] += sub[k];
-    for (let c = 0; c <= nCells; c++) start[c] = sub[c * NSUB];
-    const data = new Float32Array(n * 8),
-      fill = sub.slice();
-    for (let i = 0; i < n; i++) {
-      const o = fill[key[i]]++ * 8;
-      for (let j = 0; j < 8; j++) data[o + j] = glints[i * 8 + j];
-    }
-    return { data, n, start, sub, lo, hi };
-  };
   // The ravens' snags (birds.js): tall dead trunks standing in the open, two inside the meadow's edge and two on the
   // lake's shore by the boardwalk, each 10 to 21 m from the loop and seen against fog or sky from it. Placed last and by hand (no
   // draw from rnd): nothing else moves for them. Their tops, where a raven stands: x y z
@@ -3649,15 +3543,12 @@ export function makeWorld(D, T) {
       ...c.ends,
       ...(c.walk || []),
     ]),
-    glints: packG(),
     chunks: chunks.map((c) => packC(c)),
     props: props.map((c) => packC(c, (sc) => sc + 1)),
     boulders: boulders.map((b) => packC(b, (sc) => sc * 1.5 + 1)),
-    schools,
     blocks,
     walls,
     trees,
-    snags,
     ravenSnags,
     wood,
     // each leaf store whole, and again only its cards of the lower ranks, for the distance (scene.js LEAVES)
@@ -3676,8 +3567,6 @@ export function makeWorld(D, T) {
     solids: { data: new Float32Array(sol.data), ranges: sol.ranges },
     volD,
     gm,
-    fish: new Float32Array(fish),
-    mantas: new Float32Array(mantas),
     snow,
   };
 }
@@ -3685,7 +3574,7 @@ export function makeWorld(D, T) {
 // ---------------------------------------------------------------- procedural meshes
 // a rock: an icosphere pushed about by noise and cut by four random planes
 export function meshChunk(sd, sub = 2, det = sub > 2) {
-  if (!MEDIUM && sub > 1) sub--; // Low: a quarter of the triangles
+  if (!HIGH && sub > 1) sub--; // below High: a quarter of the triangles
   rseed(100 + sd);
   // Nine planes, most cutting deep, on a lump only a little uneven: broken faces that meet at edges. And every
   // triangle gets its own corners, so each face is lit as a face (a few triangles shaded round read as a lump)
@@ -3757,7 +3646,7 @@ export function meshTrunk(kind) {
   rseed(300 + kind);
   const pole = kind === 6,
     m = new Mesh(),
-    sides = pole ? 5 : MEDIUM ? 8 : 6,
+    sides = pole ? 5 : HIGH ? 8 : 6,
     bark = () => 1,
     r0 = [0.021, 0.03, 0.022, 0.016, 0.026, 0.05, 0.011][kind];
   if (kind < 2 || kind > 4) {
@@ -3841,7 +3730,7 @@ export function meshTrunk(kind) {
 // (lod: 0 near, 1 mid, 2 far)
 export function meshLog(lod = 0) {
   rseed(77);
-  if (!MEDIUM && !lod) lod = 1; // (Low: the middle mesh from the start, so a log never changes close by)
+  if (!HIGH && !lod) lod = 1; // (below High: the middle mesh from the start, so a log never changes close by)
   const m = new Mesh(),
     sides = [10, 8, 4][lod],
     n = [12, 8, 1][lod],
@@ -3997,7 +3886,7 @@ export function meshStick(far = false) {
 // A stump with root flares, about 1 wide and 0.8 tall, snapped: its rim stands in splinters of uneven height (by
 // the angle, so every level of detail has the same outline) round a hollow, pale wood at aux 0.24, dark at 0
 export function meshStump(lod = 0) {
-  const seg = [10, MEDIUM ? 7 : 10, 5][lod],
+  const seg = [10, HIGH ? 7 : 10, 5][lod],
     m = meshLathe(
       [
         [0.66, 0, 0.6],
@@ -4047,99 +3936,4 @@ export function meshShroom(far = false) {
         8,
         0.15,
       );
-}
-// a soaring bird (vsManta): wings from x -1 to 1 with aux = how far out, the head at +z; body and tail at aux 0
-export function meshBird() {
-  const m = new Mesh(),
-    N = 8,
-    lead = [],
-    trail = [];
-  for (let j = 0; j <= N; j++) {
-    const u = (j / N) * 2 - 1,
-      au = abs(u),
-      chord = 0.3 * (1 - 0.55 * au * au),
-      back = -0.18 * au * au;
-    lead.push(m.v(u, 0.02 * (1 - au), back + chord * 0.5, u));
-    trail.push(m.v(u, 0, back - chord * 0.5, u));
-  }
-  for (let j = 0; j < N; j++)
-    m.quad(lead[j], lead[j + 1], trail[j + 1], trail[j]);
-  m.tube(
-    [
-      [0, 0, 0.42],
-      [0, 0.01, 0.3],
-      [0, 0, 0.05],
-      [0, 0, -0.28],
-    ],
-    (k) => [0.03, 0.06, 0.075, 0.03][k],
-    5,
-    true,
-    () => 0,
-  );
-  m.tri(m.v(0, 0, -0.25, 0), m.v(0.12, 0, -0.5, 0), m.v(-0.12, 0, -0.5, 0));
-  return m;
-}
-// A flock member (vsFish), nose at +x, wings out along z at aux 0 (the shader beats them): 0 a butterfly, 1 a small
-// bird. far: without the butterfly's body, the bird's in three sides
-export function meshFlyer(kind, far = false) {
-  const m = new Mesh(),
-    wing = (pts) => {
-      const v = pts.map((p) => m.v(p[0], 0, p[1], 0));
-      for (let k = 1; k < v.length - 1; k++) m.tri(v[0], v[k], v[k + 1]);
-    };
-  if (kind === 0) {
-    if (!far)
-      m.tube(
-        [
-          [0.22, 0, 0],
-          [0, 0, 0],
-          [-0.25, 0, 0],
-        ],
-        (k) => [0.02, 0.035, 0.012][k],
-        3,
-        true,
-        () => 1,
-      );
-    for (const s of [-1, 1]) {
-      wing([
-        [0.05, 0],
-        [0.3, s * 0.42],
-        [0.02, s * 0.5],
-        [-0.05, s * 0.2],
-      ]);
-      wing([
-        [-0.02, 0],
-        [-0.04, s * 0.22],
-        [-0.3, s * 0.34],
-        [-0.22, s * 0.05],
-      ]);
-    }
-  } else {
-    m.tube(
-      [
-        [0.5, 0, 0],
-        [0.32, 0.02, 0],
-        [0, 0, 0],
-        [-0.3, 0, 0],
-      ],
-      (k) => [0.02, 0.09, 0.12, 0.04][k],
-      far ? 3 : 5,
-      true,
-      () => 1,
-    );
-    for (const s of [-1, 1])
-      wing([
-        [0.12, s * 0.06],
-        [0.1, s * 0.5],
-        [-0.12, s * 0.42],
-        [-0.14, s * 0.06],
-      ]);
-    wing([
-      [-0.28, 0.06],
-      [-0.55, 0.1],
-      [-0.55, -0.1],
-      [-0.28, -0.06],
-    ]);
-  }
-  return m;
 }

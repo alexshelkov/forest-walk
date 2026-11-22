@@ -1,6 +1,9 @@
 // ============================================================================
 // math + procedural helpers (load-time only unless noted)
 // ============================================================================
+// Shared by every scene module and by shaders.js: Math's functions, the seeded random stream, noise, quaternions, the
+// world grid and its layout (NX, VS, CELLS, LAKE, OPEN: the shaders read the same numbers), surface nets and the
+// Mesh builder that every procedural mesh is made with. Plain JavaScript, no browser.
 export const {
   sin,
   cos,

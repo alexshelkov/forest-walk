@@ -1,5 +1,5 @@
 // Types for scene.js, the WebGPU renderer kept in the plain JavaScript of the project it grew from. Its modules are
-// built for the level (Low or Medium) quality.js sets as they load: import it only after chooseLevel (main.ts).
+// built for the tier (High, Medium or Low) quality.js sets as they load: import it only after chooseLevel (main.ts).
 
 /**
  * What the frame loop reads. Touch: walk while held, look deltas in CSS pixels (consumed each frame). A keyboard
@@ -28,6 +28,77 @@ export interface SceneEnv {
   dev?: boolean;
 }
 
+/** What the budget view shows (Scene.budget): the last 2 s of frames and the last frame's make. */
+export interface Budget {
+  level: string;
+  why: string;
+  /** frames in the last 2 s, their mean and worst interval, this thread's mean, the GPU's mean (-1: not told) */
+  frames: number;
+  frameMs: number;
+  worstMs: number;
+  cpuMs: number;
+  gpuMs: number;
+  /** the render size and the screen's, in pixels: w, h, screen w, screen h */
+  size: number[];
+  /** each group: its name, triangles, draw calls */
+  groups: [string, number, number][];
+  draws: number;
+  /** the frame's render passes */
+  passes: number;
+  /** the culling cells drawn, of all */
+  cells: number[];
+  gpu: string;
+  /** the JS heap in MB (below 0: the browser does not tell); what the GPU was asked to hold: buffers, textures (MB) */
+  heapMB: number;
+  gpuMB: number[];
+  /** the load's bake pieces' waits in ms by name (a long run of one as its count, range and sum), and the pipelines
+   * compiled ahead (how many, the wait) */
+  bake: string;
+  pipelines: string;
+  /** how gpuMs is timed: by the GPU's timer, or from the frame's submit to the GPU's done */
+  gpuBy: string;
+  /** frames a second aimed at; the screen's measured refresh rate (Hz); a frame drawn on every so many refreshes */
+  target: number;
+  hz: number;
+  every: number;
+  /** what the first minute decided of the tier: a promotion or demotion and why, or how far it is ('' none) */
+  decided: string;
+  /** the view's length, the fog's reach (the Try knob d; the tuner changes only the pixels), the render size's floor (px) and
+   * whether the tuner is at it; the Try knobs' code */
+  det: number;
+  pixMin: number;
+  atFloor: boolean;
+  tryCode: string;
+}
+/** One part of a measure: its medians (ms) with it off, and what leaving it out saved against the all-on stretches
+ * on either side (ms; NaN: not told); in the noise: a saving smaller than the all-on stretches' spread. */
+export interface MeasureRow {
+  part: string;
+  frames: number;
+  wallMs: number;
+  gpuMs: number;
+  savedMs: number;
+  gpuSavedMs: number;
+  inNoise: boolean;
+  gpuInNoise: boolean;
+}
+export interface Measure {
+  /** all on, the mean of its stretches' medians: a frame from its submit to the GPU's done (wall), by the GPU's
+   * timer, this thread's (ms; NaN: not told) */
+  base: { wall: number; gpu: number; cpu: number };
+  /** the all-on stretches' spread (max less min, ms): what a saving must pass to count */
+  noise: { wall: number; gpu: number };
+  /** most saved first, by the wall time */
+  rows: MeasureRow[];
+  byGpu: boolean;
+}
+/** The Try knobs (scene.js KNOBS): the code, each knob's value, and each one's choices (its first: today's). */
+export interface Knobs {
+  code: string;
+  values: Record<string, number | string>;
+  choices: Record<string, (number | string)[]>;
+}
+
 export interface Scene {
   pause(): void;
   resume(): void;
@@ -35,6 +106,19 @@ export interface Scene {
   wake(): void;
   /** One line of numbers since the last call: frame rate, worst frame, render size, draw distance, level. */
   stats(): string;
+  /** The budget view's numbers. */
+  budget(): Budget;
+  /** The Try knobs as they are; knob sets one (kept on this device); tryCode sets all from a code (others today's). */
+  knobs(): Knobs;
+  knob(key: string, value: number | string): void;
+  tryCode(code: string): void;
+  /**
+   * Times frames one at a time, standing still, with everything on between each part left out (the render size
+   * held); `progress` hears each frame taken: the stretch's place, of how many, its name, its frames.
+   */
+  measure(
+    progress: (at: number, of: number, part: string, frames: number) => void,
+  ): Promise<Measure>;
   /** Where the walker stands: x and z, in metres. */
   walker(): number[];
   /** For looking around from a debugger: jump to a viewpoint (0-5) or to any place and target, hold a state of the weather. */
@@ -80,7 +164,7 @@ export interface Scene {
     /** The dock: where the walk onto it begins, on the boardwalk, and where its planks end (x, z each). */
     pier(): number[];
     /**
-     * Every bird: its species ('junco', 'chickadee', 'thrush', 'jay', 'raven'), where it is (x, y, z), the bearing it faces
+     * Every bird: its species ('jay' or 'raven'), where it is (x, y, z), the bearing it faces
      * (radians), what it is doing ('still', 'hop', 'peck', 'crouch', 'settle', 'flying', 'perched', 'branch hop'),
      * where it is flying to, and, once it has been flushed, its place in that flush and how far off the walker was.
      */
@@ -149,21 +233,13 @@ export interface Scene {
     ): void;
     /**
      * Bird `index` does it now: 'hop' a run of hops (on the ground, or along its branch), 'peck', 'fly' (a tree
-     * bird to another branch), 'flush' (its flock leaves the ground, it first), 'return' (the perched ones of its
-     * flock come down as soon as they may), 'walk' (a raven on the ground: a few strides on the way it faces).
+     * bird to another branch), 'flush' (one on the ground takes wing, its group's others near it after it), 'walk'
+     * (a raven on the ground: a few strides on the way it faces).
      */
     birdDo(
       index: number,
       what:
-        | 'hop'
-        | 'peck'
-        | 'fly'
-        | 'pick'
-        | 'ruffle'
-        | 'turn'
-        | 'flush'
-        | 'return'
-        | 'walk',
+        'hop' | 'peck' | 'fly' | 'pick' | 'ruffle' | 'turn' | 'flush' | 'walk',
     ): void;
     /**
      * The exposure: 0 the old rule (by how much sky reaches the walker) stopped down for bright highlights in view,
@@ -347,13 +423,17 @@ export interface Scene {
      * sky shows up to 120).
      */
     openSky(veils?: boolean): string[];
-    /** Shows or hides the debug menu of a dev machine (main.ts sets it; a no-op elsewhere). */
+    /** Shows or hides the testing menu (main.ts sets it once the menu is loaded; a no-op before). */
     menu(on: boolean): void;
     /**
      * The scene's clock (set if given, and held there if `hold`: for stills an exact time apart), how far the
      * wind has blown things so far, the wind now.
      */
     clock(seconds?: number, hold?: boolean): number[];
+    /** Leaves a part of the frame out (Measure's switches: water, shafts, leaves, plants, ...); all of them as they are. */
+    off(part?: string, on?: boolean): Record<string, boolean>;
+    /** Frames a second to aim at (set if given): the target, the measured refresh rate, every so many refreshes. */
+    target(fps?: number): number[];
     /** Where the walker is: x, y, z. */
     at(): number[];
     /** The foliage atlas: milliseconds its bake took, megabytes it holds. */
@@ -362,10 +442,6 @@ export interface Scene {
     atlasShot(layer: number, alpha?: boolean): Promise<string>;
     /** The height the walker would stand on at (x, z): the ground, or a deck over it. */
     ground(x: number, z: number): number;
-    creatures: {
-      data: Float32Array;
-      groups: { first: number; count: number }[];
-    };
   };
 }
 

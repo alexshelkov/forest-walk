@@ -99,6 +99,10 @@ export const PICS = [
   { ...limbEnd(8, 8, 9), mid: 0 },
   { ...limbEnd(9, 9, 10), mid: 0 },
 ];
+// the end of each limb end's middle twig (its second stick), in its picture's units: where W_LEAF limbPF roots a
+// tree card's second tuft, so it grows from the first's wood. By the atlas's cells 6-10 (maple, maple, birch, oak,
+// vine maple)
+export const LIMB_TIPS = PICS.slice(10).map((pic) => pic.sticks[1].slice(2, 4));
 // at most this many sub-cards and sticks to a picture
 const SUBN = 16,
   STKN = 3;

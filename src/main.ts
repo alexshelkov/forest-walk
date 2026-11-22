@@ -2,9 +2,12 @@
 // The world is built on the first visible, not while the feed preloads: the build takes seconds and
 // hundreds of MB, which would stall the tik the user is looking at.
 import { attachControls } from './controls';
+import { attachBudgetView, BUDGET_VIEW, type BudgetView } from './budget';
+import type { DebugMenu } from './debug-menu';
 import { attachReveal, decodeSheet, type Reveal } from './loader';
+import { VERSION } from './version';
 import type { Keys } from './keys';
-import { chooseLevel, DEV } from './scene/quality.js';
+import { chooseLevel, DEV, guard, STEPS } from './scene/quality.js';
 import type { Scene, SceneInput } from './scene/scene.js';
 
 const canvas = document.getElementById('scene') as HTMLCanvasElement;
@@ -16,6 +19,9 @@ const walkButton = document.getElementById('walk')!;
 // The loader's one sprite sheet (loader.ts): the logo shows once it is decoded (never half drawn), and start()
 // waits a little for it before the build takes the thread, so the logo and the painting's silhouettes are on
 // screen from the loader's first moments. 'sheet decode': from asking for it to it decoded
+// the start guard's step (quality.js guard), taken before anything shows: a load that lost the GPU or crashed makes
+// the next start a step lighter (step 3 leaves the painting out); a new VERSION starts full again
+const step = guard(VERSION);
 const logo = document.getElementById('logo')!;
 const showLogo = (): void => logo.classList.add('shown');
 performance.mark('sheet decode');
@@ -24,9 +30,30 @@ const sheetDecoded = decodeSheet().then(() => {
   showLogo();
 });
 const FIRST_PAINT_MS = 150; // the longest the load waits for it
-// Dev only: localStorage.forestArt = '0' leaves the loading screen's painting out (to time the load without it; the
-// logo still shows, from the same sheet)
+// each stage of the load and when it began (say), for the budget view's load line: each stage's first word and
+// seconds, then the whole; and how long the start waited for the sprite sheet, and whether it gave up at the cap
+const stageAt: [string, number][] = [];
+let sheetWaitMs = 0;
+let sheetCapped = false;
+function loadLine(): string {
+  if (stageAt.length < 2) return 'load: …';
+  const wait = `sheet wait ${Math.round(sheetWaitMs)} ms${sheetCapped ? ' (cap)' : ''}`;
+  const parts = stageAt
+    .slice(0, -1)
+    .map(
+      ([message, at], k) =>
+        `${message.split(' ')[0].toLowerCase()} ${((stageAt[k + 1][1] - at) / 1000).toFixed(1)}`,
+    );
+  const whole = (stageAt[stageAt.length - 1][1] - stageAt[0][1]) / 1000;
+  return `load ${whole.toFixed(1)} s: ${wait} · ${parts.join(' · ')}`;
+}
+const budgetView: BudgetView | null = BUDGET_VIEW
+  ? attachBudgetView(loadLine)
+  : null;
+// The loading screen's painting is left out at the start guard's step 3, and on a dev machine with
+// localStorage.forestArt = '0' (to time the load without it); the logo still shows, from the same sheet
 function artOff(): boolean {
+  if (step >= 3) return true;
   try {
     return DEV && localStorage.getItem('forestArt') === '0';
   } catch {
@@ -36,12 +63,7 @@ function artOff(): boolean {
 const art = document.getElementById('art')!;
 if (artOff()) art.remove();
 const reveal: Reveal = artOff()
-  ? {
-      begin: () => {},
-      last: () => {},
-      done: () => {},
-      show: () => {},
-    }
+  ? { reach: () => {}, show: () => {} }
   : attachReveal(art);
 
 const input: SceneInput = {
@@ -54,11 +76,13 @@ const input: SceneInput = {
   fast: false,
 };
 // A dev machine (quality.js DEV): the tik served by `codetik dev` on this computer. Only there the scene is on
-// `forest` in the console, with a debug menu and keyboard walking. A published build has DEV false, so none of
-// it ships (the iOS app serves tiks from 127.0.0.1 too: the hostname alone would not tell).
+// `forest` in the console, with keyboard walking. A published build has DEV false, so neither ships (the iOS app
+// serves tiks from 127.0.0.1 too: the hostname alone would not tell).
 const ON_DEV_MACHINE = DEV;
 // What is known about this run, printed under a problem; the scene adds its own lines (scene.js).
 const facts: Record<string, string> = {
+  version: `v${VERSION}`,
+  start: step ? `step ${step}: ${STEPS[step]}` : 'full',
   stage: 'starting',
   screen: `${innerWidth}x${innerHeight} @${devicePixelRatio}`,
   system: systemName(),
@@ -127,13 +151,14 @@ function showProblem(message: string, error?: unknown): void {
   ].join('\n');
 }
 
-// Each stage glides the bar on the compositor, so it moves while the build blocks this thread (the painting's steps
-// were all timed when the load began; the last stage brings in any still to come).
+// Each stage glides the bar on the compositor, so it moves while the build blocks this thread, and brings in the
+// painting's steps whose share of the bar it reaches (loader.ts), the same way.
 function say(message: string, to: number, ms: number): Promise<void> {
   if (problems.length) return Promise.reject(STOPPED);
   facts.stage = message;
+  stageAt.push([message, performance.now()]);
   status.textContent = message;
-  if (to >= 1) reveal.last();
+  reveal.reach(to, ms);
   const animation = bar.animate(
     [{ transform: `scaleX(${loaded})` }, { transform: `scaleX(${to})` }],
     {
@@ -155,14 +180,17 @@ async function start(): Promise<void> {
   // the sheet first (at most FIRST_PAINT_MS), its logo shown and painted once, then the load; the wait is the
   // performance measure 'loader wait'
   performance.mark('loader wait');
-  await Promise.race([
-    sheetDecoded,
-    new Promise((done) => setTimeout(done, FIRST_PAINT_MS)),
+  const waitFrom = performance.now();
+  sheetCapped = await Promise.race([
+    sheetDecoded.then(() => false),
+    new Promise<boolean>((done) =>
+      setTimeout(() => done(true), FIRST_PAINT_MS),
+    ),
   ]);
+  sheetWaitMs = performance.now() - waitFrom;
   showLogo();
   await new Promise((done) => requestAnimationFrame(() => setTimeout(done)));
   performance.measure('loader wait', 'loader wait');
-  reveal.begin();
   try {
     // the level first (it asks the GPU adapter): every module of the scene is built for it
     await chooseLevel();
@@ -188,10 +216,13 @@ async function start(): Promise<void> {
   }
   if (problems.length) return;
   facts.stage = 'running';
+  stageAt.push(['', performance.now()]);
+  budgetView?.attach(scene);
+  if (menuWanted()) void attachMenu(scene);
   // on a dev machine: `forest.debug.view(3)` in the console jumps between the six viewpoints
   if (ON_DEV_MACHINE) {
-    Object.assign(window, { forest: scene });
-    void attachDevTools(scene);
+    Object.assign(window, { forest: scene, budgetView });
+    void attachDevTools();
   }
   // The scene runs behind the loader for a moment, so the resolution and draw distance settle (and the
   // resizes that takes) before anyone sees it.
@@ -200,20 +231,57 @@ async function start(): Promise<void> {
   setTimeout(() => {
     if (problems.length) return;
     document.body.dataset.state = 'ready';
-    reveal.done();
   }, SETTLE_MS);
 }
 
-// The dev machine's tools, loaded only there: the keyboard (keys.ts) and the debug menu (debug-menu.ts), which
-// scene.debug.menu(false) hides.
-async function attachDevTools(active: Scene): Promise<void> {
-  const [{ attachKeys }, { attachDebugMenu }] = await Promise.all([
-    import('./keys'),
-    import('./debug-menu'),
-  ]);
+// The dev machine's tool, loaded only there: the keyboard (keys.ts)
+async function attachDevTools(): Promise<void> {
+  const { attachKeys } = await import('./keys');
   keys = attachKeys(input, markWalked);
-  const menu = attachDebugMenu(active, toggleStats);
-  active.debug.menu = menu.show;
+}
+
+// The testing menu (debug-menu.ts), in every build but hidden: four quick taps in the top right corner show or
+// hide it, kept on this device (MENU_KEY). It is loaded the first time it is wanted, once the scene is built;
+// scene.debug.menu(false) hides it for clean stills.
+const MENU_KEY = 'forestTestMenu'; // '1': shown. Never on by default: users get a clean screen
+let menu: DebugMenu | null = null;
+let menuLoading: Promise<DebugMenu> | null = null;
+function menuWanted(): boolean {
+  try {
+    return localStorage.getItem(MENU_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+function attachMenu(active: Scene): Promise<DebugMenu> {
+  menuLoading ??= import('./debug-menu').then(({ attachDebugMenu }) => {
+    menu = attachDebugMenu(active, toggleStats, budgetView, () =>
+      showMenu(false),
+    );
+    active.debug.menu = menu.show;
+    return menu;
+  });
+  return menuLoading;
+}
+function showMenu(on: boolean): void {
+  try {
+    localStorage.setItem(MENU_KEY, on ? '1' : '');
+  } catch {
+    // storage is blocked: it shows or hides for this load only
+  }
+  if (!on) {
+    menu?.show(false);
+    return;
+  }
+  // (asked for while loading: it comes once the scene is built)
+  if (!scene) return;
+  void attachMenu(scene).then((shown) => {
+    shown.show(true);
+    shown.open();
+  });
+}
+function toggleMenu(): void {
+  showMenu(!(menu ? menu.shown() : menuWanted()));
 }
 
 // Anything else that goes wrong is shown too: a silent failure looks like a black screen.
@@ -227,7 +295,7 @@ addEventListener('unhandledrejection', (event) => {
   showProblem(`Unhandled: ${message}`, reason);
 });
 
-// The stats line is a tuning tool: four quick taps in the top right corner show or hide it.
+// The stats line is a tuning tool, shown or hidden from the testing menu.
 function startStats(): void {
   if (!statsOn || statsTimer || !scene) return;
   const active = scene;
@@ -282,12 +350,13 @@ const controls = attachControls(
   walkButton,
   input,
   () => scene?.wake(),
-  toggleStats,
+  toggleMenu,
 );
 walkButton.addEventListener('pointerdown', markWalked, { once: true });
 
 function onVisible(): void {
   if (problems.length) return;
+  budgetView?.resume();
   if (!booted) void start();
   else scene?.resume();
   startStats();
@@ -295,6 +364,7 @@ function onVisible(): void {
 }
 
 function onHidden(): void {
+  budgetView?.pause();
   controls.release();
   keys?.release();
   scene?.pause();

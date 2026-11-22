@@ -1,5 +1,5 @@
 // ============================================================================
-// birds: a small mind on the CPU, the pose in the vertex shader (W_ANIM vsBird)
+// birds: a small mind on the CPU, the pose in the vertex shader (W_ANIM vsJay)
 // ============================================================================
 // A bird is one instance of 12 floats: where its feet are and its length; a quaternion; its species with its own
 // seed in the fraction; the wings' phase; how far they are spread (2 more while it is in the air); the head's
@@ -26,68 +26,24 @@ import {
   TAU,
 } from './math.js';
 
-// the body's axis over the feet, in lengths (vsBird and fsBird know it too)
+// the body's axis over the feet, in lengths, of which meshCorvid takes its builds' (vsJay's JAX and RAX)
 const AXIS = 0.3;
-// What a bird is, by species (the index is what fsBird paints by). shape: 0 the songbird's mesh, 1 the jay's. len:
-// metres. notice, leave: how near the walker comes before it stops what it does, and before it goes. speed: on the
-// wing. beat: the wingbeats a second it is shown at (a real small bird's would strobe). wing: how it flies: in
-// bounds (a burst of beats, then shut), steadily, or a few beats and a glide. high: how far over the ground it
-// perches. sits: about how long between two things it does on a branch; hops, flits: how often that thing is a
-// hop along the branch, or a flight to another
+// What a bird is, by species (the index goes with each instance: vsJay tells the raven by it). shape: 0 the jay's
+// mesh, 1 the raven's. len: metres. notice, leave: how near the walker comes before it stops what it does, and
+// before it goes. speed: on the wing, where each flies a few beats and then glides. beat: the wingbeats a second it
+// is shown at. high: how far over the ground it perches. sits: about how long between two things it does on a
+// branch; hops, flits: how often that thing is a hop along the branch, or a flight to another
 const SPECIES = [
-  {
-    name: 'junco',
-    shape: 0,
-    len: 0.15,
-    notice: 8,
-    leave: 4.6,
-    speed: 7,
-    beat: 12,
-    wing: 'bound',
-    high: [2.5, 7],
-    sits: 6,
-    hops: 0,
-    flits: 0,
-  },
-  {
-    name: 'chickadee',
-    shape: 0,
-    len: 0.13,
-    notice: 5,
-    leave: 2.6,
-    speed: 6,
-    beat: 12,
-    wing: 'bound',
-    high: [2.5, 9],
-    sits: 1.4,
-    hops: 0.3,
-    flits: 0.45,
-  },
-  {
-    name: 'thrush',
-    shape: 0,
-    len: 0.24,
-    notice: 9,
-    leave: 5.5,
-    speed: 8,
-    beat: 9,
-    wing: 'steady',
-    high: [2.5, 5.5],
-    sits: 9,
-    hops: 0.05,
-    flits: 0.03,
-  },
   {
     name: 'jay',
     rest: 0.5,
     restGround: 0.22,
-    shape: 1,
+    shape: 0,
     len: 0.42,
     notice: 9,
     leave: 4.2,
     speed: 9,
     beat: 6,
-    wing: 'glide',
     high: [0.8, 8],
     sits: 2.4,
     hops: 0.25,
@@ -100,7 +56,7 @@ const SPECIES = [
     name: 'raven',
     rest: 0.65,
     restGround: 0.38,
-    shape: 2,
+    shape: 1,
     len: 0.73,
     notice: 16,
     leave: 9, // (about 9 m: its boldness spreads it from 7.4 to 10.6)
@@ -108,7 +64,6 @@ const SPECIES = [
     beat: 3.5,
     beatUp: 1.1, // (its beats off the perch and to land, against its own: deep and slow still)
     beatDown: 1.3,
-    wing: 'glide',
     glide: 0.35, // the wingbeat's phase it glides at (vsJay's Form: the arms a little raised, the hands level)
     bursts: [1, 2.4, 0.9, 1.7], // seconds of glide, then of beating (each from, to)
     fanFly: 0.65, // its tail in flight: a spread wedge
@@ -157,190 +112,6 @@ const STRIDE = 0.2; // a raven's step, in its lengths (vsJay's Form.stride)
 const NEAR = 9; // metres: beyond it the far mesh
 const SLEEP = 70; // metres from its group's home: beyond it a group neither moves nor is drawn
 
-// A bird's mesh, nose at +z, a length of 1 from bill to tail tip, its feet at the origin. A vertex's aux says what it
-// is: 0 the body, 0.06 to 0.13 the tail (outward), -0.07 a leg, -0.12 an eye, over 0.15 a wing (how far out along
-// it, signed by side). far: fewer sides, no legs or eyes. rings: bill tip to tail root, each z, radius, height over
-// the axis; wing: its shoulder's x, its span, its leading edge at the root, its chord at root and tip; tail: rows
-// from root to tip, each z, half its width, half its depth; eye: x, height over the axis, z; crest: a jay's
-function meshOf({ rings, wing, tail, eye, crest }, far) {
-  const m = new Mesh();
-  m.tube(
-    rings.map((ring) => [0, AXIS + ring[2], ring[0]]),
-    (k) => rings[k][1],
-    far ? 4 : 6,
-    true,
-    () => 0,
-  );
-  // the wings: flat, from the shoulder out; shut, the shader draws them into the body
-  const stations = far ? [0, 0.45, 1] : [0, 0.22, 0.45, 0.72, 1];
-  for (const side of [-1, 1]) {
-    const edge = stations.map((out) => {
-      const x = side * (wing[0] + wing[1] * out),
-        lead = wing[2] - 0.1 * out * out,
-        aux = side * (0.2 + 0.8 * out);
-      return [
-        m.v(x, AXIS + 0.05, lead, aux),
-        m.v(x, AXIS + 0.05, lead - mix(wing[3], wing[4], out * out), aux),
-      ];
-    });
-    for (let k = 0; k < edge.length - 1; k++)
-      m.quad(edge[k][0], edge[k + 1][0], edge[k + 1][1], edge[k][1]);
-  }
-  // The tail: a flat wedge of feathers, which the shader fans. Its two edges (aux 0.13) are the outer feathers,
-  // white on a junco; its middle (aux 0.06) is dark
-  const rows = (far ? [tail[0], tail[tail.length - 1]] : tail).map(
-    ([z, wide, deep]) => {
-      const y = AXIS - 0.01 + (z - tail[0][0]) * 0.1;
-      return [
-        m.v(0, y + deep, z, 0.06),
-        m.v(wide, y, z, 0.13),
-        m.v(0, y - deep, z, 0.06),
-        m.v(-wide, y, z, 0.13),
-      ];
-    },
-  );
-  for (let k = 0; k < rows.length - 1; k++)
-    for (let side = 0; side < 4; side++)
-      m.quad(
-        rows[k][side],
-        rows[k][(side + 1) % 4],
-        rows[k + 1][(side + 1) % 4],
-        rows[k + 1][side],
-      );
-  m.quad(...rows[rows.length - 1]);
-  if (far) return m;
-  if (crest) {
-    // a jay's crest: a small pyramid on the crown, its point up and back
-    const [front, back, tip] = crest.map((p) => m.v(0, AXIS + p[0], p[1], 0)),
-      mid = [(crest[0][0] + crest[1][0]) / 2, (crest[0][1] + crest[1][1]) / 2],
-      left = m.v(-0.035, AXIS + mid[0], mid[1], 0),
-      right = m.v(0.035, AXIS + mid[0], mid[1], 0);
-    m.tri(front, left, tip);
-    m.tri(left, back, tip);
-    m.tri(back, right, tip);
-    m.tri(right, front, tip);
-  }
-  for (const side of [-1, 1]) {
-    // two legs a little apart, one a step ahead of the other, each with its toes
-    const z = side * 0.05;
-    m.tube(
-      [
-        [side * 0.065, AXIS - 0.1, z - 0.03],
-        [side * 0.07, 0, z],
-      ],
-      () => 0.012,
-      3,
-      true,
-      () => -0.07,
-    );
-    m.tri(
-      m.v(side * 0.07, 0.004, z - 0.015, -0.07),
-      m.v(side * 0.11, 0.004, z + 0.08, -0.07),
-      m.v(side * 0.035, 0.004, z + 0.08, -0.07),
-    );
-    // an eye: an octahedron
-    const r = 0.02,
-      corners = [
-        [1, 0, 0],
-        [-1, 0, 0],
-        [0, 1, 0],
-        [0, -1, 0],
-        [0, 0, 1],
-        [0, 0, -1],
-      ].map((d) =>
-        m.v(
-          side * eye[0] + d[0] * r,
-          AXIS + eye[1] + d[1] * r,
-          eye[2] + d[2] * r,
-          -0.12,
-        ),
-      );
-    for (const f of [
-      [0, 2, 4],
-      [2, 1, 4],
-      [1, 3, 4],
-      [3, 0, 4],
-      [2, 0, 5],
-      [1, 2, 5],
-      [3, 1, 5],
-      [0, 3, 5],
-    ])
-      m.tri(corners[f[0]], corners[f[1]], corners[f[2]]);
-  }
-  return m;
-}
-// the songbird (junco, chickadee, thrush): plump, the head carried high, a short bill
-export const meshSongbird = (far) =>
-  meshOf(
-    {
-      rings: far
-        ? [
-            [0.5, 0.004, 0.09],
-            [0.36, 0.11, 0.11],
-            [0.1, 0.17, 0],
-            [-0.08, 0.155, -0.02],
-            [-0.25, 0.03, 0],
-          ]
-        : [
-            [0.5, 0.004, 0.09],
-            [0.43, 0.036, 0.1],
-            [0.39, 0.085, 0.115],
-            [0.32, 0.118, 0.115],
-            [0.23, 0.115, 0.075],
-            [0.1, 0.17, 0],
-            [-0.06, 0.16, -0.02],
-            [-0.19, 0.085, -0.015],
-            [-0.25, 0.03, 0],
-          ],
-      wing: [0.07, 0.6, 0.18, 0.3, 0.1],
-      tail: [
-        [-0.19, 0.022, 0.03],
-        [-0.36, 0.045, 0.024],
-        [-0.5, 0.055, 0.016],
-      ],
-      eye: [0.1, 0.135, 0.345],
-    },
-    far,
-  );
-// the jay: longer in the tail and the bill, a crest on the crown, broad wings
-export const meshJay = (far) =>
-  meshOf(
-    {
-      rings: far
-        ? [
-            [0.5, 0.004, 0.1],
-            [0.33, 0.095, 0.125],
-            [0.14, 0.125, 0.02],
-            [0.0, 0.12, -0.01],
-            [-0.14, 0.03, 0],
-          ]
-        : [
-            [0.5, 0.004, 0.1],
-            [0.41, 0.04, 0.11],
-            [0.375, 0.075, 0.125],
-            [0.31, 0.1, 0.125],
-            [0.25, 0.09, 0.09],
-            [0.14, 0.125, 0.02],
-            [0.02, 0.125, -0.01],
-            [-0.08, 0.07, -0.01],
-            [-0.14, 0.03, 0],
-          ],
-      wing: [0.07, 0.62, 0.21, 0.3, 0.14],
-      tail: [
-        [-0.1, 0.03, 0.028],
-        [-0.3, 0.05, 0.022],
-        [-0.5, 0.06, 0.014],
-      ],
-      eye: [0.085, 0.14, 0.335],
-      crest: [
-        [0.215, 0.375],
-        [0.2, 0.3],
-        [0.37, 0.3],
-      ],
-    },
-    far,
-  );
-
 // The crow family's birds (the jay, the raven): one build of parts that vsJay moves each in its own way, from a form
 // of numbers. A vertex's aux is a whole number of 127ths that says which part it is: 0 the body and the bill; 3 to
 // 11 (signed by side) a tail feather, the further out the higher; -14 a leg, -16 a toe, -18 an eye, -20 a crest
@@ -350,7 +121,7 @@ export const meshJay = (far) =>
 // spread, the tail shut, the crest raised. far: the same parts, fewer of each, so the one hands over to the other
 // without a jump. (vsJay's Form holds the wing's, tail's, foot's and head's numbers of each: kept the same)
 function meshCorvid(form, far) {
-  // (a jay carries its body lower over its feet than the songbird: vsJay's JAX; a raven higher, on long legs: RAX)
+  // (a jay carries its body low over its feet: vsJay's JAX; a raven higher, on long legs: RAX)
   const AX = AXIS - 0.1 + (form.lift || 0),
     m = new Mesh(),
     vane = new Map(),
@@ -839,8 +610,8 @@ const turnTo = (a, b) => {
 
 // makeBirds: ground(x, z) the height stood on; avoid(x, z, pad) a place moved out of trunks, rocks and rails; dry(x,
 // z) is it land a bird may stand on; perches: the dead branches to sit on, 8 numbers each (world.js: root x y z,
-// length, bearing, tilt, bend, 0); groups: who lives where: x, z of its home, r its range, n how many, species,
-// and lives 'ground' (a flock that feeds on the ground and flies up to branches) or 'tree'
+// length, bearing, tilt, bend, 0); homes(n): who lives where (scene.js: the jays' homes): x, z of its home, r its
+// range, n how many, species, and lives 'tree' (the ravens' groups, made here, live 'raven')
 export function makeBirds({
   ground,
   avoid,
@@ -996,8 +767,6 @@ export function makeBirds({
     flushIn: -1,
     perch: -1,
     along: 0.6,
-    calm: 0,
-    comeDown: 0,
     left: null,
     held: false,
     crest: 0.3, // how far its crest is raised
@@ -1094,7 +863,6 @@ export function makeBirds({
       group.off = -9; // when one of it last took wing
       group.wave = 0; // how many have left in this flush
       group.waveAt = -99;
-      group.moveIn = wait(30);
       const kind = SPECIES[group.species];
       for (let k = 0; k < group.n; k++) {
         const bird = fresh(g, kind);
@@ -1104,31 +872,21 @@ export function makeBirds({
           birds.push(bird);
           continue;
         }
-        if (group.lives === 'ground') {
-          const spot = groundSpot(group, { x: 1e6, z: 1e6 }, 0) || [
-            group.x,
-            group.z,
-          ];
-          bird.x = spot[0];
-          bird.z = spot[1];
-          bird.y = ground(spot[0], spot[1]);
-        } else {
-          // (a tree bird starts on a branch of its range: the first near the others of its group; none free, no bird)
-          bird.x = group.x;
-          bird.z = group.z;
-          bird.y = ground(group.x, group.z);
-          const k0 = perchesFor(
-            bird,
-            { x: 1e6, z: 1e6 },
-            0,
-            group.r,
-            group.at,
-            false,
-          )[0];
-          if (k0 === undefined) continue;
-          sitOn(bird, k0, 0.6);
-          if (!group.at) group.at = [bird.x, bird.y, bird.z];
-        }
+        // (a tree bird starts on a branch of its range: the first near the others of its group; none free, no bird)
+        bird.x = group.x;
+        bird.z = group.z;
+        bird.y = ground(group.x, group.z);
+        const k0 = perchesFor(
+          bird,
+          { x: 1e6, z: 1e6 },
+          0,
+          group.r,
+          group.at,
+          false,
+        )[0];
+        if (k0 === undefined) continue;
+        sitOn(bird, k0, 0.6);
+        if (!group.at) group.at = [bird.x, bird.y, bird.z];
         birds.push(bird);
       }
     });
@@ -1253,7 +1011,7 @@ export function makeBirds({
       if (flyTo(bird, feet(bird, k, 0.6), k, walker)) return true;
     return false;
   };
-  // one of a ground flock takes wing for a branch; where there is none free, for the ground further from the walker
+  // one on the ground (set down there by debug.bird) takes wing for a branch; none free, for the ground further off
   const takeOff = (bird, walker, by) => {
     if (flyToPerch(bird, perchesFor(bird, walker, 4, 24, by, true), walker))
       return true;
@@ -1264,8 +1022,8 @@ export function makeBirds({
       flyTo(bird, [spot[0], ground(spot[0], spot[1]), spot[1]], -1, walker)
     );
   };
-  // The flock leaves in a ripple: one has had enough and sets all within a few metres of it going, the nearest
-  // to the walker first. left: its place in the ripple and how far off the walker was
+  // Those on the ground leave in a ripple: one has had enough and sets all of its group within a few metres of it
+  // going, the nearest to the walker first. left: its place in the ripple and how far off the walker was
   const flush = (first, walker) => {
     const group = groups[first.group];
     if (clock - group.waveAt > 12) {
@@ -1331,7 +1089,7 @@ export function makeBirds({
     const wary = near || clock < bird.alertUntil;
     bird.crest +=
       ((wary ? 1 : 0.2) - bird.crest) * min(1, h / (wary ? 0.12 : 0.7));
-    // the tail flicks open and shut (a junco's shows its white)
+    // the tail flicks open and shut
     bird.flickNext -= h;
     if (bird.flickNext <= 0 && bird.mode !== 'fly') {
       bird.flickNext = wait(2.2);
@@ -1415,7 +1173,7 @@ export function makeBirds({
       if (bird.next <= 0) {
         const pick = chance();
         if (bird.run > 0 || pick < (near ? 0.25 : 0.5)) {
-          // a run of hops: the first may turn it, toward the middle of the flock's ground when it has strayed
+          // a run of hops: the first may turn it, toward its group's home when it has strayed
           if (bird.run <= 0) {
             bird.run = 2 + floor(chance() * 4);
             const home = atan2(group.z - bird.z, group.x - bird.x),
@@ -1519,23 +1277,15 @@ export function makeBirds({
     bird.pitch =
       clamp(atan2(ty, level || 1e-4), -0.9, 0.9) * (1 - flare) + 0.7 * flare;
     bird.fwd = flare;
-    // Small birds bound: a burst of beats, then the wings shut for a moment. A jay beats a few times, then glides
-    // on spread wings. A thrush beats steadily. Leaving and landing all of them beat throughout
-    const glides = kind.wing === 'glide';
+    // A few beats, then a glide on spread wings (bursts: the seconds of each); leaving and landing it beats
+    // throughout
     flight.burst -= h * (flight.burst > 0 ? 1 : -1);
     if (flight.burst > 0 && flight.burst < h)
-      flight.burst = -(glides
-        ? between(...(kind.bursts || [0.4, 0.9]))
-        : between(0.09, 0.15));
+      flight.burst = -between(...(kind.bursts || [0.4, 0.9]));
     else if (flight.burst < 0 && flight.burst > -h)
-      flight.burst = glides
-        ? between(...(kind.bursts || [0, 0, 0.6, 0.95]).slice(2))
-        : between(0.16, 0.26);
-    const beating =
-      first || flare > 0 || flight.burst > 0 || kind.wing === 'steady';
-    bird.spread +=
-      ((beating || glides ? 1 : 0) - bird.spread) *
-      min(1, h / (first ? 0.07 : 0.035));
+      flight.burst = between(...(kind.bursts || [0, 0, 0.6, 0.95]).slice(2));
+    const beating = first || flare > 0 || flight.burst > 0;
+    bird.spread += (1 - bird.spread) * min(1, h / (first ? 0.07 : 0.035));
     if (beating)
       bird.phase +=
         TAU *
@@ -1543,7 +1293,7 @@ export function makeBirds({
         (first ? (kind.beatUp ?? 1.5) : flare > 0 ? (kind.beatDown ?? 2) : 1) *
         h;
     // (gliding, the wings come level and stay there)
-    else if (glides)
+    else
       bird.phase += turnTo(bird.phase, kind.glide ?? -0.15) * min(1, h / 0.1);
     bird.fan +=
       ((flare > 0 || first ? 1 : (kind.fanFly ?? 0.3) + (flight.steer || 0)) -
@@ -1569,8 +1319,6 @@ export function makeBirds({
       bird.landed = bird.pitch;
       bird.alertUntil = clock + between(2, 4);
       bird.next = wait(flight.perch >= 0 ? kind.sits : 1.5);
-      bird.calm = 0;
-      bird.comeDown = between(20, 40);
       bird.along = 0.6;
       bird.alongNow = undefined;
       // (on a branch it sits across it, turned the lesser way; on a raven's low perch across the path; on a post's
@@ -1647,25 +1395,9 @@ export function makeBirds({
     bird.actT = 0;
     return true;
   };
-  // a flight to another branch: a chickadee keeps to where its party is, the others cross to another tree
-  const flit = (bird, walker) => {
-    const group = groups[bird.group],
-      party = bird.kind.name === 'chickadee';
-    return flyToPerch(
-      bird,
-      party
-        ? perchesFor(bird, walker, 0.7, 30, group.at, false).filter(
-            (k) =>
-              hypot(
-                seat[k * 4] - group.at[0],
-                seat[k * 4 + 1] - group.at[1],
-                seat[k * 4 + 2] - group.at[2],
-              ) < 5.5,
-          )
-        : perchesFor(bird, walker, 6, 24, null, false),
-      walker,
-    );
-  };
+  // a flight to another branch, in another tree
+  const flit = (bird, walker) =>
+    flyToPerch(bird, perchesFor(bird, walker, 6, 24, null, false), walker);
   // a hop about on the spot: on a branch to face the other way across it, on a post's top any way
   const turnAbout = (bird) => {
     bird.turn0 = bird.yaw;
@@ -1679,7 +1411,6 @@ export function makeBirds({
   };
   const onPerch = (bird, h, walker) => {
     const kind = bird.kind,
-      group = groups[bird.group],
       dist = heed ? hypot(bird.x - walker.x, bird.z - walker.z) : 1e3,
       close = hypot(dist, bird.y - walker.y),
       rain = walker.rain > 0.3,
@@ -1748,30 +1479,9 @@ export function makeBirds({
       }
       return;
     }
-    if (group.lives === 'ground') {
-      // One of a ground flock comes down again when the walker has stood still a while, or has gone from the
-      // flock's ground: each by its own count, and not while another of the flock is on the wing
-      const home = hypot(group.x - walker.x, group.z - walker.z);
-      bird.calm += rain
-        ? 0
-        : walker.still > 3
-          ? h
-          : home > 14 || !heed
-            ? h * 2.5
-            : -bird.calm;
-      if (bird.calm > bird.comeDown && clock - group.off > between(1.2, 3)) {
-        const spot = groundSpot(group, walker, walker.still > 3 ? 3.4 : 9);
-        if (
-          !spot ||
-          !flyTo(bird, [spot[0], ground(spot[0], spot[1]), spot[1]], -1, walker)
-        )
-          bird.calm = bird.comeDown - between(2, 6);
-        return;
-      }
-    }
     // The walker too close: off to another perch. While they walk, to one further on the way they are going
     // (from a rail to the next post along it); standing, away from them
-    if (close < (group.lives === 'ground' ? 2.2 : kind.leave * bird.bold)) {
+    if (close < kind.leave * bird.bold) {
       const by =
         walker.speed > 0.5
           ? [
@@ -2673,25 +2383,6 @@ export function makeBirds({
             ? max(CROSSING_LEAST, wait(CROSSING_EVERY))
             : between(3, 6);
     }
-    // a party of chickadees moves on through the trees: its place shifts, and the birds follow one by one
-    for (const group of groups) {
-      if (group.asleep || group.species !== 1 || !group.at) continue;
-      group.moveIn -= h * (walker.rain > 0.3 ? 0.2 : 1);
-      if (group.moveIn > 0) continue;
-      group.moveIn = wait(30);
-      const lead = birds.find((b) => b.group === groups.indexOf(group));
-      if (!lead) continue;
-      const k = perchesFor(
-        { ...lead, x: group.at[0], z: group.at[2] },
-        walker,
-        6,
-        15,
-        null,
-        false,
-      )[0];
-      if (k !== undefined)
-        group.at = [seat[k * 4], seat[k * 4 + 1], seat[k * 4 + 2]];
-    }
     for (const bird of birds) {
       if (bird.held || groups[bird.group].asleep) continue;
       if (bird.mode === 'gone') ravenBack(bird, h, walker);
@@ -2704,11 +2395,11 @@ export function makeBirds({
     }
   };
 
-  // ---- the instances: by mesh (the songbird's near and far, the jay's, the raven's), and the blots
+  // ---- the instances: by mesh (the jay's near and far, the raven's), and the blots
   const data = new Float32Array(MOST * 32), // (a bird, and a stick under it, each 16)
     blots = new Float32Array(MOST * 8),
-    // songbirds near and far, jays near and far, ravens near and far, blots, sticks (scene.js draws them so)
-    counts = [0, 0, 0, 0, 0, 0, 0, 0];
+    // jays near and far, ravens near and far, blots, sticks (scene.js draws them so)
+    counts = [0, 0, 0, 0, 0, 0];
   const order = [];
   const write = (walker) => {
     order.length = 0;
@@ -2774,7 +2465,7 @@ export function makeBirds({
       const under = ground(bird.x, bird.z),
         high = bird.y - under;
       if (high < 0.4) {
-        const b = counts[6]++ * 8;
+        const b = counts[4]++ * 8;
         blots[b] = bird.x;
         blots[b + 1] = under + 0.012;
         blots[b + 2] = bird.z;
@@ -2789,7 +2480,7 @@ export function makeBirds({
         // (on a post's top: a small one under its feet and belly)
         blots.set(
           [bird.x, bird.y + 0.004, bird.z, 0.18 * bird.len, 0.45, 0, 0, 0],
-          counts[6]++ * 8,
+          counts[4]++ * 8,
         );
       }
     });
@@ -2807,10 +2498,10 @@ export function makeBirds({
           qAxis(1, 0, 0, -atan2(b[1] - a[1], hypot(b[0] - a[0], b[2] - a[2]))),
         );
       data.set(
-        [mid[0], mid[1], mid[2], 0.3, ...q, 3, 0, 0, 0.5, 0.05, 0.05, 0, 80.5],
+        [mid[0], mid[1], mid[2], 0.3, ...q, 0, 0, 0, 0.5, 0.05, 0.05, 0, 80.5],
         at++ * 16,
       );
-      counts[7]++;
+      counts[5]++;
     }
   };
 
@@ -2995,8 +2686,8 @@ export function makeBirds({
       }
     },
     // act(k, what): bird k does it now: 'hop' (a run of hops, on the ground or along its branch), 'peck', 'fly' (a
-    // tree bird to another perch), 'pick', 'ruffle', 'turn' (on its perch), 'flush' (its flock leaves the ground,
-    // it first), 'return' (the perched ones of its flock come down as soon as they may)
+    // tree bird to another perch), 'pick', 'ruffle', 'turn' (on its perch), 'flush' (one on the ground takes wing,
+    // its group's others near it after it), 'walk' (a raven on the ground)
     act(k, what, walker) {
       const bird = birds[k];
       if (!bird) return;
@@ -3005,10 +2696,6 @@ export function makeBirds({
       if (what === 'flush' && bird.mode === 'ground') {
         groups[bird.group].lead = null;
         flush(bird, walker);
-      } else if (what === 'return') {
-        for (const b of birds)
-          if (b.group === bird.group && b.mode === 'perch')
-            b.calm = b.comeDown + 1;
       } else if (
         what === 'walk' &&
         bird.kind.name === 'raven' &&

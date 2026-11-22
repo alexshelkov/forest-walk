@@ -10,4 +10,48 @@ tags:
 category:
   - relax
   - ambient
-visibility: private
+visibility: unlisted
+summary: |-
+  ### IDEA
+  A first-person walk through a misty autumn forest on a phone. Old conifers and golden broadleaf trees, ferns and leaf litter, a trail loop with side paths, a creek and brooks with bridges and log crossings, a lake with a boardwalk, a pier and a boat, signposts. The weather drifts (clear, fog, rain, storm with lightning and thunder). Jays and ravens fly the paths, deer graze at the meadow and now and then one leaps the path ahead. All sound is synthesised: steps by surface, rain, wind, thunder, water, birds. Hold the bottom-left corner to walk, drag anywhere to look. The loader is a painted forest that fills in with the progress bar.
+
+  ### TECH
+  WebGPU, no libraries, no build config. The world is generated at load from fixed seeds, so it is the same forest every time: a density field on the GPU in slices, terrain by surface nets on the CPU, trees and plants as instanced cards cut from a foliage atlas painted at load, shadows baked once. Each frame: scene, water, light shafts, bloom, exposure, post; paced to 30 fps, with a tuner that moves the render size to hold it. Three tiers (quality.js): High, Medium, and Low, a light path where the lighting of the ground, rocks, wood and leaves is baked at load and cards are two quads with no sway. The tier is chosen at the first start; a slow start or a lost GPU steps down by itself. Sound: Web Audio, every sound computed in idle slices after load (sounds.js), placed and mixed live (audio.js).
+
+  ### STYLE
+  Muted, misty autumn: deep greens, brown bark, golden and russet broadleaf, pale warm fog, low sun through the crowns. Realism, nothing saturated. The screen stays empty: a thin ring with a small spaced label to walk, nothing else. Calm, low sound.
+
+  ### LAYOUT
+  - src/main.ts: entry: loader, controls, visible/hidden, starts the scene, the error screen, the testing menu.
+  - src/scene/scene.js: renderer and frame: device, pipelines, load-time bakes, walk, weather (WEATHER, DRIFT), scene.debug.
+  - src/scene/shaders.js: all WGSL: W_SOLID (ground, rock, wood), W_LEAF (cards), W_POST; Low's light variants.
+  - src/scene/world.js: the generator: trail, paths, streams, trees, plants, props, crossings, lake.
+  - src/scene/quality.js: the tiers and their settings, the tier choice, the start guard.
+  - atlas.js, sprigs.js: foliage pictures and near sub-cards. water.js: streams. math.js: noise, random streams.
+  - birds.js, deer.js; sounds.js, audio.js.
+  - src/loader.ts with public/assets/loader/loader.webp (one sprite sheet); src/controls.ts (walk corner, look drag, the four-tap gesture); src/budget.ts (debug view); src/debug-menu.ts (testing menu); src/version.ts.
+  - index.html: loader, walk ring and label.
+
+  ### GOTCHAS
+  - Judge every change at Low on a phone first (reference: an Adreno 6xx Android). A desktop hides the problems.
+  - No GPU job at load may run long: one 2 s job made Android drop the device. Bake in small pieces, each submitted and awaited, as the atlas tiles do.
+  - Compile new pipelines with the async calls before the first frame, beside the others.
+  - Keep values written to half-float targets under 65504: an overflow showed as black blocks on iOS.
+  - A feature with a per-frame cost needs a Low path or a Low switch. Never make Low slower.
+  - The forest is seeded: each generator system has its own stream (rseed(n) in world.js). A new system takes a new unused number; extra rnd() calls inside an existing system move every tree after them.
+  - Bump src/version.ts by one as the last edit of every change: the debug view and the error screen show it.
+  - Testing: four quick taps in the top right corner open the testing menu (weather, places, sound, tier, and the debug view with Measure and the Try knobs). Both stay hidden by default.
+  - tik.yaml: use codetik set; only summary and suggestions are written by hand.
+suggestions:
+  - title: Morning fog walk
+    subtitle: Start in thick fog that lifts slowly into sun
+    instructions: |-
+      Make every walk begin in a thick, still morning fog that thins over the first two minutes and opens into low sun through the trees, then lets the usual weather drift take over. The weather lives in src/scene/scene.js: the states in WEATHER and their order and lengths in DRIFT; the fog's density is FOG. Change only the start of the drift and how fast the fog eases out; do not touch the shaders. Check it at Low first (four quick taps in the top right corner open the testing menu; its Weather row shows each state). Bump src/version.ts by one as the last edit.
+  - title: A cabin in the woods
+    subtitle: A small log cabin at the end of a side path
+    instructions: |-
+      Put a small log cabin with a stone chimney and a thin plume of smoke at the far end of one side path, with a woodpile and a chopping stump. Build its meshes in src/scene/world.js beside the other props (meshLog, meshStump, the bench and signposts show the pattern) and place it in a new generator system that starts its own random stream with rseed(300), so no existing tree moves; clear the trees and plants from its footprint. The smoke can reuse the air particles in scene.js. Walking must stop at its walls like at the rails. Check at Low first; any new pipeline is compiled before the first frame with the others. Add a signpost label for it. Bump src/version.ts by one as the last edit.
+  - title: Snowy winter forest
+    subtitle: Snow on the boughs, a frozen lake, falling snow
+    instructions: |-
+      Turn the forest to deep winter: snow lying on the ground and paths, on the conifer boughs and the tops of logs and rocks; bare broadleaf trees; a frozen lake with snow on the ice; gently falling snow (the weather's rain becomes snow, the storm a blizzard); footprints behind the walker; soft crunching steps and quiet wind. Snow on surfaces goes in the shaders (src/scene/shaders.js: W_SOLID for ground, rock and wood, W_LEAF for the cards, by how much a surface faces up), the bare trees and the frozen lake in src/scene/world.js and scene.js, the steps' sound in src/scene/sounds.js. Do it in stages, each checked at Low on a phone first: ground and paths, then boughs, then falling snow, then the lake, then sound. Low bakes its lighting at load, so add the snow to its bake too. Bake work at load in small pieces, each submitted and awaited. Bump src/version.ts by one as the last edit of each stage.

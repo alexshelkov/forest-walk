@@ -14,6 +14,10 @@ codetik publish                    # a draft on the server; --live releases it
 grants, backends, and the asset budget. Read it before changing anything, and
 point your coding agent at it.
 
+The `summary` in `tik.yaml` maps this tik's code and lists the rules that keep
+it running on phones (tiers, load-time bakes, the version label, the testing
+menu). Read it next.
+
 For the long version, give your agent the `codetik` skill: `codetik skill`
 asks which agents you use (Claude Code, Codex, Cursor) and installs it where
 each of them loads it from for every project. In Claude Code, `/codetik` runs

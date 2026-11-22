@@ -356,7 +356,7 @@ const MAXR = [FORE, FORE, HIND, HIND].map(([, a, b]) =>
   SWING = 0.7;
 
 // ---------------------------------------------------------------- small helpers
-// (rotation helpers as in creatures.js) the quaternion of the frame with right r, up u, forward f (r x u = f)
+// the quaternion of the frame with right r, up u, forward f (r x u = f)
 const quat = (out, o, r, u, f) => {
   const tr = r[0] + u[1] + f[2];
   let x, y, z, w;

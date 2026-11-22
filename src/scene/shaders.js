@@ -1,7 +1,11 @@
+// Every WGSL source of the scene but the atlas's (atlas.js) and the deer's coat (deer.js DEER_WGSL): one string per
+// shader module, built for the tier as this module loads (quality.js values read into the code). scene.js compiles
+// each with mod() and names its entry points in its pipelines. WGSL lives in template strings: no backtick, and a
+// `${` only where a JS value is meant, in a comment too.
 import {
   AA,
   ATLAS,
-  MEDIUM,
+  HIGH,
   NEAR_D,
   RAYD,
   RAYN,
@@ -13,7 +17,7 @@ import {
 import { LAKE, NX, NY, NZ, OPEN, OX, OY, OZ, TDN, VS } from './math.js';
 import { DEER_WGSL } from './deer.js';
 import { SN } from './water.js';
-import { PICS, SLOTS, STEM_B, STEM_T, STEM_W } from './sprigs.js';
+import { LIMB_TIPS, PICS, SLOTS, STEM_B, STEM_T, STEM_W } from './sprigs.js';
 
 // ============================================================================
 // WGSL sources
@@ -266,7 +270,7 @@ const WK = array<vec3f, 10>(vec3f(1., 2., 1.), vec3f(-2., 1., .9), vec3f(3., 1.,
 `;
 
 // ---------------------------------------------------------------- shared scene code
-// G.sun.w: how overcast it is (0 clear, 1 raining). G.mis: the old rule's exposure, light shafts, draw distance scale,
+// G.sun.w: how overcast it is (0 clear, 1 raining). G.mis: the old rule's exposure, light shafts, (free),
 // debug.sprigs. G.wx: how wet things are, wind, rain falling, haze per metre
 export const S_G = /*wgsl*/ `
 // (fl: the way to the lightning in the sky and how bright it is now; st: storm, thick fog, the flash's kind, its
@@ -275,11 +279,11 @@ export const S_G = /*wgsl*/ `
 // where the fog closes (hazeT), all following the fog: W_LEAF thin and vsFar, scene.js lodNow; ex: the highlights'
 // key H, 1 for the old exposure rule (W_POST), ex.z debug.isolate's part (1 the tree without its far picture, 2
 // the far picture alone); ea: the frame's seconds, 1 to take its measure at once (W_METER); dbg: debug.isolate's
-// place x, z and reach, 1 a white mask, 2 the tree shaded alone)
-struct G { vp: mat4x4f, sm: mat4x4f, cam: vec4f, right: vec4f, up: vec4f, fwd: vec4f, sun: vec4f, res: vec4f, mis: vec4f, wx: vec4f, fl: vec4f, st: vec4f, wy: vec4f, lt: vec4f, ls: vec4f, lf: vec4f, ex: vec4f, ea: vec4f, dbg: vec4f };
+// place x, z and reach, 1 a white mask, 2 the tree shaded alone; kn: the budget view's Try knobs, scene.js knobs:
+// the trees' cards kept, the plants' kept (shares of what thin keeps), the ground's shadow taps, sway on)
+struct G { vp: mat4x4f, sm: mat4x4f, cam: vec4f, right: vec4f, up: vec4f, fwd: vec4f, sun: vec4f, res: vec4f, mis: vec4f, wx: vec4f, fl: vec4f, st: vec4f, wy: vec4f, lt: vec4f, ls: vec4f, lf: vec4f, ex: vec4f, ea: vec4f, dbg: vec4f, kn: vec4f };
 const SUNC = vec3f(3.3, 1.9, .86);
 const TAU = 6.2831853;
-const LOW = ${!MEDIUM};
 fn sat(x: f32) -> f32 { return clamp(x, 0., 1.); }
 // debug.isolate: is a tree's card or a solid rooted at p left out, being away from the one place shown?
 fn isoOut(p: vec3f) -> bool { return g.dbg.w > .5 && distance(p.xz, g.dbg.xy) > g.dbg.z; }
@@ -288,6 +292,8 @@ fn isoSkip(far: bool) -> bool { return g.dbg.w > .5 && g.ex.z > .5 && (g.ex.z < 
 fn ss(a: f32, b: f32, x: f32) -> f32 { let t = clamp((x - a) / (b - a), 0., 1.); return t * t * (3. - 2. * t); }
 fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(.06711056, .00583715)))); }
 fn hs(x: f32) -> f32 { return fract(sin(x * 127.1) * 43758.5453); }
+// What a scene colour leaves through. The HDR targets are half floats: a value over 65504 is infinity there, and an
+// iPhone turned that into NaN black blocks, so every colour and depth written to one is capped well under it
 fn fin(c: vec3f) -> vec4f { return vec4f(min(max(c, vec3f(0.)), vec3f(40.)), 1.); }
 // A flash of lightning's light in a direction: cold, most toward where it is in the sky. One term for the sky,
 // the fog (through skyC) and the sky's light on things, so the forest stands dark against a lit sky and fog
@@ -366,7 +372,8 @@ fn shadow4(p: vec3f) -> f32 {
         + textureSampleCompareLevel(tSh, sS, s.xy + vec2f(-e, e), s.z) + textureSampleCompareLevel(tSh, sS, s.xy + vec2f(e, e), s.z)) * .25;
 }
 fn shadow9(p: vec3f) -> f32 {
-  if (LOW) { return shadow4(p); }
+  if (g.kn.z < 1.5) { return shadow1(p); }
+  if (g.kn.z < 6.5) { return shadow4(p); }
   let s = shUV(p); let e = 2.1 / ${SHADOW}.; var a = 0.;
   for (var x = -1; x <= 1; x++) { for (var y = -1; y <= 1; y++) { a += textureSampleCompareLevel(tSh, sS, s.xy + vec2f(f32(x), f32(y)) * e, s.z); } }
   return a / 9.;
@@ -421,19 +428,23 @@ fn fogC(rd: vec3f) -> vec3f {
 }
 // (with a ground mist on top: what lies within two metres of the ground fades sooner, and sooner still by the
 // streams, where the mist gathers)
-fn fog(c: vec3f, wp: vec3f) -> vec3f {
+// fogParts: what the fog adds along the line of sight to wp (rgb) and what it lets through (a); fog(c) = c * a + rgb
+fn fogParts(wp: vec3f) -> vec4f {
   let v = wp - g.cam.xyz; let d = length(v); let rd = v / d;
   let sg = textureSampleLevel(tS, sC, (wp.xz - ${VOL0}.xz) / ${MAPW}, 0.);
   let low = ss(2.2, .1, wp.y - sg.b) * (1. + 1.5 * ss(8., 1., sg.r));
   var T = hazeT(d, rd.y, g.cam.y) * exp(-low * max(d - 8., 0.) * .007);
   // (thick fog is uneven and drifts slowly: denser and thinner patches, taken part way along the ray)
-  let un = textureSampleLevel(tD, sR, (g.cam.xz + v.xz * min(.6, 16. / d)) * .013 + g.cam.w * vec2f(.007, .003), 0.).a;
-  T = pow(T, 1. + (un - .5) * 1.5 * g.st.y);
+  if (g.st.y > 0.) {
+    let un = textureSampleLevel(tD, sR, (g.cam.xz + v.xz * min(.6, 16. / d)) * .013 + g.cam.w * vec2f(.007, .003), 0.).a;
+    T = pow(T, 1. + (un - .5) * 1.5 * g.st.y);
+  }
   // The fog between the trunks is lit by what sky reaches it (the light volume, part way along the ray): dimmer
   // and greener in the stand, bright along a gap. What is nearly gone takes the plain colour, as the sky does
   let lf = mix(mix(.5, 1., vol(g.cam.xyz + v * min(.55, 26. / d)).g), 1., ss(.45, .9, 1. - T));
-  return c * T + fogC(rd) * mix(vec3f(.88, 1., .9), vec3f(1.), lf) * lf * (1. - T);
+  return vec4f(fogC(rd) * mix(vec3f(.88, 1., .9), vec3f(1.), lf) * lf * (1. - T), T);
 }
+fn fog(c: vec3f, wp: vec3f) -> vec3f { let f = fogParts(wp); return c * f.a + f.rgb; }
 fn qrot(q: vec4f, v: vec3f) -> vec3f { return v + 2. * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
 // The wind at a plant standing at p, h metres up it: a lean downwind that comes and goes as gusts roll over the
 // forest, and a slower rocking on top. Trunks (W_SOLID) and leaves (W_LEAF) move by the same amount, so a tree
@@ -444,7 +455,7 @@ fn sway(p: vec2f, h: f32, t: f32) -> vec2f {
   let a = pow(max(h, 0.), 1.3) * (.002 + .016 * g.wx.y * (.35 + .65 * gust));
   // the way it pushes wanders from place to place, so neighbours do not all lean alike
   let way = .46 + 1.1 * sin(dot(p, vec2f(.13, .09))) + .5 * sin(dot(p, vec2f(-.07, .21)));
-  return a * (vec2f(cos(way), sin(way)) * (.15 + .35 * gust) + .6 * vec2f(sin(t * .7 + ph * 9. + h * .09), cos(t * .53 + ph * 12. + h * .07)) + .2 * vec2f(sin(t * 1.9 + ph * 3. + h * .3), cos(t * 1.6 + ph * 2. + h * .23)));
+  return a * g.kn.w * (vec2f(cos(way), sin(way)) * (.15 + .35 * gust) + .6 * vec2f(sin(t * .7 + ph * 9. + h * .09), cos(t * .53 + ph * 12. + h * .07)) + .2 * vec2f(sin(t * 1.9 + ph * 3. + h * .3), cos(t * 1.6 + ph * 2. + h * .23)));
 }
 // One layer of small pointed leaves, one to a cell of a grid, each turned its own way: x is 1 on a leaf, y and z
 // are the leaf's own two random numbers (for its hue and shade), w how far from its midrib to its edge this is
@@ -521,12 +532,11 @@ fn folC(kind: i32, h: f32, j: f32) -> vec3f {
 }
 `;
 
-// ---------------------------------------------------------------- solid meshes (ground, rocks, trunks, logs, woodwork, mushrooms, animals)
+// ---------------------------------------------------------------- solid meshes (ground, rocks, trunks, logs, woodwork, mushrooms, deer)
 // An instance: a = position + scale, b = quaternion, c = material, seed, texture scale (or where a small rock has
-// faded out), bob. Materials: 0 ground, 1 rock, 2 bark, 3 planks, 4 mushroom, 6 animals
-export const W_SOLID =
-  S_B +
-  /*wgsl*/ `
+// faded out), bob. Materials: 0 ground, 1 rock, 2 bark, 3 planks, 4 mushroom, 6 a deer (deer.js)
+// what W_SOLID and W_SOLID_LOW share: the vertex's layout and its placing
+const SOLID_HEAD = /*wgsl*/ `
 struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) b: vec4f, @location(4) c: vec4f };
 struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f, @location(3) on: vec3f,
   @location(4) @interpolate(flat) m: vec4f, @location(5) @interpolate(flat) q: vec4f, @location(6) ao: f32,
@@ -537,7 +547,7 @@ fn place(i: VI, grow: f32) -> VO {
   var sc = i.a.w; var lp = i.p;
   lp += normalize(vec3f(i.n.x, 0., i.n.z) + vec3f(1e-5, 0., 0.)) * (grow / max(sc, 1e-3));
   let cd = distance(i.a.xyz, g.cam.xyz);
-  if (i.c.x < 1.5 && i.c.z > 1.5 && g.res.x > 0.) { sc *= 1. - ss(i.c.z * .7, i.c.z, cd / g.mis.z); }
+  if (i.c.x < 1.5 && i.c.z > 1.5 && g.res.x > 0.) { sc *= 1. - ss(i.c.z * .7, i.c.z, cd); }
   var w = i.a.xyz + qrot(i.b, lp * sc);
   // living trees (bark of kinds 0-4 and 6) bend in the wind; snags, logs and stumps stand still
   if (i.c.x > 1.5 && i.c.x < 2.5 && (i.c.y < 5. || (i.c.y >= 6. && i.c.y < 7.))) { let sw = sway(i.a.xz, lp.y * sc, g.cam.w); w.x += sw.x; w.z += sw.y; }
@@ -551,6 +561,11 @@ fn place(i: VI, grow: f32) -> VO {
 // The bark's relief near the walker: the trunk drawn a second time a few centimetres out (less on a thin trunk),
 // of which fs keeps only the ridges between the furrows. Against the fog a trunk's outline is then broken by them
 @vertex fn vsShell(i: VI) -> VO { var o = place(i, clamp(i.a.w * .0018, .006, .045)); o.sh = 1.; return o; }
+`;
+export const W_SOLID =
+  S_B +
+  SOLID_HEAD +
+  /*wgsl*/ `
 struct TP { h: f32, c: f32, n: vec3f };
 fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   var w = pow(abs(n), vec3f(4.)); w /= (w.x + w.y + w.z);
@@ -563,10 +578,15 @@ fn tri(p: vec3f, n: vec3f, s: f32) -> TP {
   return o;
 }
 ${DEER_WGSL}
-@fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+// A solid's shading (fs), and the parts of it the Low tier bakes for its ground (fsBake). bake: as seen from 20 m and
+// from straight above, with no rain and the dapple's mean for its moving pattern. SS: the colour, and for the bake
+// the albedo (with what a stream's water takes of it), the sun's share (sunE() times it), and the ambient's ao, sky,
+// horizon glow (side's factor) and up² (amb's)
+struct SS { c: vec3f, alb: vec3f, sun: f32, ao: f32, sky: f32, side: f32, up2: f32, near: vec4f };
+fn shade(i: VO, ff: bool, bake: bool) -> SS {
   let mat = i32(i.m.x + .5); let sd = i.m.y; let fl_ = select(-1., 1., ff);
   let on = normalize(i.on) * fl_; let n0 = normalize(i.n) * fl_;
-  let dist = length(i.wp - g.cam.xyz);
+  let dist = select(length(i.wp - g.cam.xyz), 20., bake);
   let ts = select(1., i.m.z, mat >= 2);
   // four scales of the detail texture; the finest (F) only shows within a few metres, on the ground, rock and bark
   let A = tri(i.op, on, .1 * ts); let B = tri(i.op, on, .43 * ts); let C = tri(i.op, on, 1.9 * ts); let F = tri(i.op, on, 6.7 * ts); let fk = ss(10., 1.5, dist) * f32(mat <= 2);
@@ -585,11 +605,11 @@ ${DEER_WGSL}
   // plank's side would else read the ground it stands in, and come out black)
   let lift = vec3f(0., (1. - abs(n0.y)) * 1.2 * f32(mat >= 1), 0.);
   let v1 = vol(i.wp + n0 * 1.5 + lift); let v2 = vol(i.wp + n0 * 4.5 + lift);
-  let dp = dap(i.wp, dist, ss(.6, .95, v1.g));
+  let dp = select(dap(i.wp, dist, ss(.6, .95, v1.g)), mix(.8, 1., ss(.6, .95, v1.g) * .45), bake);
   let hgt = A.h * .5 + B.h * .35 + C.h * .15;
   // wet: the sheen, there as soon as it rains; soaked: the ground and bark darkening and the puddles filling,
   // slowly, and less under the crowns
-  let wet = g.wx.x; let soaked = g.wy.y * mix(.6, 1., v1.g);
+  let wet = select(g.wx.x, 0., bake); let soaked = select(g.wy.y * mix(.6, 1., v1.g), 0., bake);
   var bump = 1.7; var gloss = .1; var alb = vec3f(0.); var vao = 1.; var sgro = 0.;
   var tl = 0.;                         // how much light passes through (a far crown, a mushroom's cap)
   var onPath = 0.;                     // how much this is the trail's trodden earth
@@ -597,7 +617,7 @@ ${DEER_WGSL}
   var puddle = 0.;                     // standing water on the dirt track
   var mud = 0.;                        // and how much of that is a muddy patch
   var film = 0.;                       // standing or running water over the ground: the creek, the shore, puddles
-  var glw = vec3f(0.); var gk = 0.;    // animals: the glow of an owl's eyes, and how much of an eye this is
+  var nearK = vec4f(0.);               // (the bake: where the near layers go, for Low: litter, herbs, gravel, leaf path)
   var wrapL = 0.;                      // how far the sun's light wraps round a coat (a deer's: fur scatters it)
   var sunK = 1.;                       // and how much of it the coat takes direct
   var grain = 0.;                      // how deep the streaks of Wd cut: bark furrows, the grain of planks
@@ -653,9 +673,13 @@ ${DEER_WGSL}
       // Near the walker the floor is drawn leaf by leaf, three sizes of them over each other: herbs over the moss
       // in their patches, darker in the gaps; and where the litter lies, fallen leaves with a midrib each, dark
       // and wet in the gaps between them
-      let fa = leafAt(i.wp.xz * 6.); let fb = leafAt(vec2f(i.wp.x * .8 - i.wp.z * .6, i.wp.x * .6 + i.wp.z * .8) * 11. + 5.3);
-      // (the litter: a few big lobed leaves over many small ones, not every cell filled, so the duff shows between)
-      let fg = leafL(vec2f(i.wp.x * .6 + i.wp.z * .8, i.wp.z * .6 - i.wp.x * .8) * 3.3 + 9.1);
+      // (none of it in the bake, too fine from 20 m: there the leaves' mean shade colours the leaf-covered path)
+      var fa = vec4f(0., .35, .5, .5); var fb = fa; var fg = fa;
+      if (!bake) {
+        fa = leafAt(i.wp.xz * 6.); fb = leafAt(vec2f(i.wp.x * .8 - i.wp.z * .6, i.wp.x * .6 + i.wp.z * .8) * 11. + 5.3);
+        // (the litter: a few big lobed leaves over many small ones, not every cell filled, so the duff shows between)
+        fg = leafL(vec2f(i.wp.x * .6 + i.wp.z * .8, i.wp.z * .6 - i.wp.x * .8) * 3.3 + 9.1);
+      }
       let ft = select(select(fb, fa, fa.x > .5), fg, fg.x > .5);
       let leafy = max(fg.x, max(fa.x * step(.3, fa.z), fb.x * step(.35, fb.z))); let nearF = ss(15., 5., dist);
       let herbs = herbK * (1. - sat(lk * 3.)) * nearF; let herby = max(fa.x, fb.x);
@@ -713,8 +737,9 @@ ${DEER_WGSL}
       path = mix(path, mossC, ss(.8, .5, gm.r + (C.c - .5) * .4) * ss(.42, .6, B.c) * .6 * (1. - g3));
       path = mix(path, fc, leafy * nearF * (.08 + .4 * sat(lk * 2.)) * step(mk, 1.5));
       gr = mix(gr, path, tk);
+      nearK = vec4f(sat(lk * 2.5) * (1. - tk), herbK * (1. - sat(lk * 3.)) * (1. - tk), isGravel * tk, max(1. - abs(mk - 2.), 0.) * tk);
       // twigs and sticks lying on the forest floor (hardly any on a path)
-      gr = mix(gr, vec3f(.13, .10, .075) * (.7 + .6 * C.h), twigAt(i.wp.xz * 2.7 + 4.4) * nearF * (1. - grass) * (1. - .85 * tk) * .8);
+      if (!bake) { gr = mix(gr, vec3f(.13, .10, .075) * (.7 + .6 * C.h), twigAt(i.wp.xz * 2.7 + 4.4) * nearF * (1. - grass) * (1. - .85 * tk) * .8); }
       gr *= 1. - .5 * ct * (1. - tk * .5);
       sgro = mix(sgro, root * 1.4, tk); onPath = tk * mix(1., rut, g3); pathMid = tk * mid * (1. - g3);
       // The lake's waterline: a wet dark band of mud and pebbles from the water to a hand over it (the water laps
@@ -810,23 +835,10 @@ ${DEER_WGSL}
     alb = mix(vec3f(.78, .74, .64), cap, ss(.3, .6, i.ao)) * (.6 + .5 * B.h);
     gloss = .35; bump = .6; tl = .3;
   } else {
-    // Animals (creatures.js): sd = species + hue. Aux: 1 coat, .5 dark parts, 0 antler, hoof or bill, below 0 eyes.
-    // Species: 0 deer, 1 fox, 2 squirrel (grey or red), 3 owl, 4 duck
-    let sp = i32(sd); let hv = fract(sd); let ax = abs(i.ao);
-    var back = mix(vec3f(.30, .18, .09), vec3f(.38, .24, .12), hv); var under = vec3f(.62, .54, .42);
-    var dark = vec3f(.10, .07, .05); var bone = vec3f(.72, .66, .52);
-    if (sp == 1) { back = vec3f(.62, .24, .05); under = vec3f(.85, .82, .76); dark = vec3f(.06, .04, .03); bone = vec3f(.88, .86, .80); }
-    if (sp == 2) { back = mix(vec3f(.32, .28, .24), vec3f(.48, .22, .08), step(.5, hv)); under = vec3f(.70, .66, .58); }
-    if (sp == 3) { back = vec3f(.34, .27, .19); under = vec3f(.62, .56, .46); bone = vec3f(.15, .12, .08); glw = vec3f(2.6, 1.5, .2); }
-    if (sp == 4) { back = mix(vec3f(.30, .22, .14), vec3f(.36, .30, .22), hv); under = vec3f(.60, .56, .50); dark = vec3f(.03, .20, .10); bone = vec3f(.85, .60, .10); }
-    alb = mix(back, under, ss(.15, -.55, on.y)) * (.6 + .7 * B.h) * (.75 + .4 * ss(.3, .7, C.c));
-    alb = mix(alb, dark, ss(.75, .55, ax) * ss(.25, .45, ax));
-    alb = mix(alb, bone, ss(.3, .05, ax));
-    gk = ss(-.2, -.7, i.ao);
-    alb = mix(alb, vec3f(.012), gk);
-    gloss = .3 + .5 * gk; bump = .5;
-    // a deer (deer.js): its own coat, by its part (species 8 and over)
-    if (sp >= 8) { let dc = deerCoat(sp - 8, lp / ts, on, i.ao, hv, B.h * .5 + C.h * .5); alb = mix(dc.rgb, vec3f(.012), gk); gloss = mix(dc.a, .8, gk); bump = .08; wrapL = .6; sunK = .6; }
+    // a deer (deer.js, material 6): sd = 8 + its part, its own hue in the fraction; aux below 0 its eyes
+    let gk = ss(-.2, -.7, i.ao);
+    let dc = deerCoat(i32(sd) - 8, lp / ts, on, i.ao, fract(sd), B.h * .5 + C.h * .5);
+    alb = mix(dc.rgb, vec3f(.012), gk); gloss = mix(dc.a, .8, gk); bump = .08; wrapL = .6; sunK = .6;
   }
   // Where a trunk, a post, a log or a stone meets the ground (within a hand or two over it, on its upright faces):
   // darker, and a little of the ground's moss on it
@@ -844,11 +856,12 @@ ${DEER_WGSL}
   let rip = film * cos((i.wp.x * .8 + i.wp.z * .35) * 6. + A.c * 9. - g.cam.w * 2.5) * .25;
   // raindrops' rings on the standing water (near the walker: further off they are finer than a pixel)
   var rg = vec3f(0.);
-  if (film * g.wx.z > .01 && dist < 14.) { rg = rings(i.wp.xz * 3.6, g.cam.w) * (film * sat(g.wx.z * 2.5) * ss(14., 6., dist)); }
+  if (film * g.wx.z > .01 && dist < 14. && !bake) { rg = rings(i.wp.xz * 3.6, g.cam.w) * (film * sat(g.wx.z * 2.5) * ss(14., 6., dist)); }
   let N = normalize(qrot(i.q, normalize(on + (A.n * .85 * (1. - .85 * onPath) + B.n * .65 * (1. - .85 * pathMid) + C.n * .45 * (1. - .6 * pathMid) * ss(60., 12., dist) + F.n * (.5 + .3 * onPath) * fk) * bump + vec3f(.8, sgro, .35) * vec3f(rip, 1., rip) + vec3f(rg.x, 0., rg.y) * 1.6 + vec3f(Wd.r - .5, 0., Wd.g - .5) * grain)));
-  let L = g.sun.xyz; let V = normalize(g.cam.xyz - i.wp);
+  let L = g.sun.xyz; let V = select(normalize(g.cam.xyz - i.wp), vec3f(0., 1., 0.), bake);
   let ao = (sat((v1.r - .5) * 8.) * .55 + sat((v2.r - .5) * 2.7) * .45) * vao * ss(.12, .6, hgt);
-  let E = sunE() * shadow9(i.wp + n0 * .1 + L * .12) * dp * mix(1., .78, f32(mat == 0));
+  let sh9 = shadow9(i.wp + n0 * .1 + L * .12);
+  let E = sunE() * sh9 * dp * mix(1., .78, f32(mat == 0));
   let ndl = sat((dot(N, L) + wrapL) / (1. + wrapL)); let ndv = sat(dot(N, V));
   let open = sat((v2.r - .5) * 2.7);
   let am = (amb(N, v1.g) + side(N, open)) * ao;
@@ -864,13 +877,203 @@ ${DEER_WGSL}
   // (taken off the smooth surface, not off every lump of the detail, so it is a soft sheen)
   let Rs = reflect(-V, normalize(mix(n0, N, .2))); let ndvs = sat(dot(normalize(mix(n0, N, .2)), V));
   c += skyC(Rs) * wet * f32(mat <= 3) * (1. - film) * (.012 + (.1 + .22 * max(onPath, f32(mat == 3))) * pow(1. - ndvs, 4.)) * (.3 + .7 * v1.g) * dry;
-  c += glw * gk;
   // Under a stream: the water takes light on the way down and back up along the bent line of sight, blue most
   // and green least (clear water with a little brown in it), and a pool adds a faint green veil of its own
   let path = max(-over, 0.) * under * (1. / max(sqrt(1. - (1. - V.y * V.y) / 1.77), .3) + 1.15);
   c = c * exp(-vec3f(.55, .38, 1.0) * path) + vec3f(.30, .32, .18) * amb(vec3f(0., 1., 0.), v1.g) * (1. - exp(-.15 * path));
+  var o: SS; o.c = c;
+  o.alb = alb * exp(-vec3f(.55, .38, 1.0) * path);
+  o.sun = sh9 * dp * mix(1., .78, f32(mat == 0)) * sunK * (ndl + tl * (.2 + .5 * sat(-dot(N, L))));
+  o.ao = ao; o.sky = v1.g; o.side = open * (1. - abs(N.y)); o.up2 = (N.y * .5 + .5) * (N.y * .5 + .5); o.near = nearK;
+  return o;
+}
+@fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+  let s = shade(i, ff, false);
   if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(-1., 0., 0., 1.); } // (debug.isolate's mask: W_POST)
-  return fin(fog(c, i.wp));
+  return fin(fog(s.c, i.wp));
+}
+// (the albedo kept as its square root: eight bits hold the dark floor's shades finer so)
+struct BK { @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f };
+@fragment fn fsBake(i: VO, @builtin(front_facing) ff: bool) -> BK {
+  let s = shade(i, ff, true);
+  return BK(vec4f(sqrt(max(s.alb, vec3f(0.))), s.sun), vec4f(s.ao, s.sky, s.side, s.up2), s.near);
+}
+`;
+
+// ---------------------------------------------------------------- the Low tier's ground and solids
+// Low (quality.js) draws the ground and the solids lighter: the ground's colour and fixed light come from its bake at
+// load (W_SOLID fsBake, scene.js: tG the albedo's square root and the sun's share, tA the ambient's ao, sky, horizon
+// glow and up², tN where fs's near layers go), with the detail texture's finest grain and, within 15 m, those layers
+// drawn as fs draws them (leaf litter, herbs, the gravel's stones, the leaf-covered path's leaves); the solids read the detail texture two or
+// three times for their grain, their light worked out per vertex. Fog per vertex for both. Left out at Low: puddles
+// and their rings, the moving dapple, highlights and the sky's sheen on wet things, the bark's relief shell, the leaf
+// twigs, the faint veil under a stream's water
+export const W_SOLID_LOW =
+  S_B +
+  SOLID_HEAD +
+  DEER_WGSL +
+  /*wgsl*/ `
+@group(1) @binding(0) var tG: texture_2d<f32>;
+@group(1) @binding(1) var tA: texture_2d<f32>;
+@group(1) @binding(2) var sL: sampler;
+@group(1) @binding(3) var tN: texture_2d<f32>;
+// k: the ground's sheen at a low angle; a solid's darkening (where it meets the ground, a stream's line, the rain),
+// moss's share, how near the ground's foot, by the water
+struct VL { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f,
+  @location(3) on: vec3f, @location(4) @interpolate(flat) m: vec4f, @location(5) ao: f32, @location(6) lit: vec3f,
+  @location(7) fog: vec4f, @location(8) k: vec4f };
+// amb and side, by up² of the normal and by side's factor (open times how upright)
+fn ambU(u2: f32, sky: f32) -> vec3f {
+  let top = mix(vec3f(.40, .50, .74), vec3f(.52, .55, .60), g.sun.w) + flashL(vec3f(0., 1., 0.)) * .05;
+  let low = mix(vec3f(.24, .23, .09), vec3f(.17, .17, .13), g.sun.w);
+  return (mix(low, top, u2) * (.42 + .58 * sky) * .8 + vec3f(.085, .075, .05) * (1. - sky) * (1. - .6 * g.sun.w)) * (1. - .3 * g.st.x);
+}
+fn sideU(k: f32) -> vec3f { return mix(vec3f(.95, .52, .22), vec3f(.30, .31, .33), g.sun.w) * k * .16; }
+fn low(o: VO) -> VL {
+  var l: VL; l.cp = o.cp; l.wp = o.wp; l.n = o.n; l.op = o.op; l.on = o.on; l.m = o.m; l.ao = o.ao;
+  l.fog = fogParts(o.wp); return l;
+}
+@vertex fn vsG(i: VI) -> VL {
+  let o = place(i, 0.); var l = low(o);
+  let ndv = sat(dot(normalize(o.n), normalize(g.cam.xyz - o.wp)));
+  l.k = vec4f(.112 * pow(1. - ndv, 2.5), 0., 0., 0.); // (fs's reflection of the sky at a low angle, off the mesh)
+  return l;
+}
+@fragment fn fsG(l: VL) -> @location(0) vec4f {
+  let uv = (l.wp.xz - ${VOL0}.xz) / ${MAPW};
+  let a = textureSample(tG, sL, uv); let b = textureSample(tA, sL, uv);
+  let dist = length(l.wp - g.cam.xyz);
+  // (the bake holds the floor as seen from 20 m; nearer, the detail texture's finest scale gives it its grain)
+  let F = textureSample(tD, sR, l.wp.xz * 6.7).b;
+  var alb = a.rgb * a.rgb * mix(1., .62 + .76 * F, ss(10., 1.5, dist));
+  if (dist < 15.) {
+    // fs's near layers where the bake says they go (n: litter, herbs, gravel, leaf path)
+    let n = textureSampleLevel(tN, sL, uv, 0.); let nearF = ss(15., 5., dist); let wp = l.wp.xz;
+    let fa = leafAt(wp * 6.); let fb = leafAt(vec2f(wp.x * .8 - wp.y * .6, wp.x * .6 + wp.y * .8) * 11. + 5.3);
+    let fg = leafL(vec2f(wp.x * .6 + wp.y * .8, wp.y * .6 - wp.x * .8) * 3.3 + 9.1);
+    let ft = select(select(fb, fa, fa.x > .5), fg, fg.x > .5);
+    let leafy = max(fg.x, max(fa.x * step(.3, fa.z), fb.x * step(.35, fb.z))); let herby = max(fa.x, fb.x);
+    var fc = mix(vec3f(.50, .36, .08), vec3f(.48, .22, .05), ss(.3, .4, ft.y));
+    fc = mix(mix(fc, vec3f(.36, .09, .04), ss(.6, .7, ft.y)), vec3f(.24, .15, .07), ss(.8, .9, ft.y)) * (.5 + .6 * ft.z) * (.65 + .35 * ft.w);
+    let herbs = n.g * nearF;
+    alb = mix(alb, mix(vec3f(.05, .14, .025), vec3f(.15, .28, .05), ft.z) * (.6 + .6 * F) * (.7 + .3 * ft.w), herbs * herby);
+    alb *= 1. - .4 * herbs * (1. - herby);
+    let litter = max(n.r, n.a) * nearF;
+    alb = mix(alb, vec3f(.045, .032, .024), litter * (1. - leafy) * .75);
+    alb = mix(alb, fc, litter * leafy * .95);
+    let ga = stoneAt(wp * 13.); let gb = stoneAt(vec2f(wp.x * .8 - wp.y * .6, wp.x * .6 + wp.y * .8) * 31. + 3.7);
+    let gs = select(gb, ga, ga.x * step(.62, ga.y) > .5);
+    let stones = max(ga.x * step(.62, ga.y), gb.x * step(.5, gb.y));
+    alb = mix(alb, mix(vec3f(.30, .28, .24), vec3f(.64, .59, .50), fract(gs.y * 7.3)) * (.85 + .2 * gs.z), n.b * nearF * stones * .9);
+  }
+  alb *= 1. - .5 * g.wy.y * mix(.6, 1., b.g); // (the rain soaks in)
+  let c = alb * (sunE() * a.a + (ambU(b.a, b.g) + sideU(b.b)) * b.r) + ambU(1., b.g) * b.r * l.k.x;
+  if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(-1., 0., 0., 1.); } // (debug.isolate's mask: W_POST)
+  return fin(c * l.fog.a + l.fog.rgb);
+}
+@vertex fn vsO(i: VI) -> VL {
+  let o = place(i, 0.); var l = low(o);
+  // (lit on its side toward the eye, as fs turns a face's normal to the eye: a plank's top seen from above)
+  let mat = i32(o.m.x + .5); let sd = o.m.y; let L = g.sun.xyz;
+  let n0 = normalize(o.n) * select(-1., 1., dot(o.n, g.cam.xyz - o.wp) >= 0.);
+  let lift = vec3f(0., (1. - abs(n0.y)) * 1.2 * f32(mat >= 1), 0.);
+  let v1 = vol(o.wp + n0 * 1.5 + lift); let v2 = vol(o.wp + n0 * 4.5 + lift);
+  let open = sat((v2.r - .5) * 2.7);
+  let ao = sat((v1.r - .5) * 8.) * .55 + open * .45;
+  // the sun through the baked shadow (the vertex's own read), with the dapple's mean; a deer's coat lets it wrap round
+  let E = sunE() * shadowV(o.wp + n0 * .1 + L * .12) * mix(.8, 1., ss(.6, .95, v1.g) * .45);
+  let coat = mat >= 5 && sd >= 8.; let wrapL = select(0., .6, coat);
+  l.lit = E * sat((dot(n0, L) + wrapL) / (1. + wrapL)) * select(1., .6, coat) + (amb(n0, v1.g) + side(n0, open)) * ao;
+  let sw = streamAt(o.wp); let byWater = step(sw.x, 3.); let over = o.wp.y - sw.y;
+  let under = ss(.03, -.05, over) * step(sw.x, .9); let damp = ss(.24, .02, over) * ss(2.2, .9, sw.x) * byWater;
+  let foot = ss(.45, 0., o.wp.y - groundAt(o.wp)) * (1. - sat(n0.y)) * f32(mat >= 1 && mat <= 3);
+  let soak = max(mix(g.wy.y * mix(.6, 1., v1.g), g.wx.x, f32(mat == 1 || mat == 3)), max(under, damp) * .9) * f32(mat <= 3);
+  // moss's share: a rock's top, a trunk's foot on its shady side and what faces up (a log: a pad on its back and
+  // down its shady side), timber's tops and shady faces
+  let lp = o.op - sd * 37.; let kind = i32(sd);
+  let sunSide = dot(normalize(n0.xz + vec2f(1e-4)), normalize(g.sun.xz)); let shady = .3 + .7 * ss(.3, -.5, sunSide);
+  var moss = mix(ss(-.05, .55, n0.y), ss(.6, .93, n0.y), f32(mat == 1));
+  if (mat == 2) {
+    moss = select(max(ss(3., .2, lp.y) * shady * f32(kind < 8), ss(.45, .9, n0.y)), max(ss(.1, .65, n0.y), shady * ss(-.4, .2, n0.y) * .4), kind == 8) * f32(kind != 3);
+  }
+  if (mat == 3) { moss = max(ss(.3, .9, n0.y), ss(.2, -.6, sunSide) * (1. - abs(n0.y)) * .7); }
+  l.k = vec4f((1. - .45 * foot) * (1. - mix(.5, .36, f32(mat == 1)) * soak - .2 * damp * (1. - under) * f32(mat <= 3)), moss, foot, byWater);
+  return l;
+}
+@fragment fn fsO(l: VL, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+  let mat = i32(l.m.x + .5); let sd = l.m.y; let ts = select(1., l.m.z, mat >= 2); let fl_ = select(-1., 1., ff);
+  let on = normalize(l.on) * fl_; let n0 = normalize(l.n) * fl_; let dist = length(l.wp - g.cam.xyz);
+  let lp = l.op - sd * 37.;
+  // the detail texture on the face's main plane at two of fs's scales (B, C), and its streaks along y (Wd)
+  let ax = abs(on);
+  let pl = select(select(l.op.xy, l.op.zy, ax.x > ax.z), l.op.xz, ax.y > max(ax.x, ax.z));
+  let B = textureSample(tD, sR, pl * .43 * ts); let C = textureSample(tD, sR, pl * 1.9 * ts);
+  let Wd = textureSample(tD, sR, vec2f((lp.x + lp.z) * 1.3, lp.y * .09));
+  let hgt = B.b * .65 + C.b * .35;
+  let mossC = mix(vec3f(.08, .19, .02), vec3f(.21, .34, .04), C.b) * (.5 + .9 * B.b);
+  var alb = vec3f(.3);
+  if (mat <= 1) {
+    // rock: grey, pale where the noise says so, darker by the water; moss as a cap
+    let rock = f32(mat == 1); let slab = rock * f32(abs(l.m.z - .5) < .01);
+    alb = mix(vec3f(.12, .12, .125), vec3f(.36, .34, .31), sat(B.a * 1.5 - .25)) * (.3 + 1.2 * hgt);
+    alb *= 1. - rock * (.3 + .25 * l.k.w);
+    alb = mix(alb, mossC * (1. - .45 * rock), l.k.y * ss(.42, .6, B.a * .6 + C.a * .45) * .9 * (1. - slab));
+    alb = mix(alb, vec3f(.5, .49, .45) * (.75 + .35 * C.b), slab * ss(.5, .9, n0.y));
+  } else if (mat == 2) {
+    // bark by the tree's kind (fs's colours), its furrows from Wd; a log's bare wood in plates; moss; cut wood
+    let kind = i32(sd); let fur = ss(.3, .68, Wd.b);
+    var bk = mix(vec3f(.035, .028, .024), vec3f(.29, .23, .18), fur);
+    if (kind == 1) { bk = mix(vec3f(.05, .035, .028), vec3f(.36, .25, .18), fur); }
+    if (kind == 2 || kind == 4) { bk = mix(vec3f(.07, .065, .06), vec3f(.32, .30, .26), fur); }
+    if (kind == 3) {
+      let Wh = textureSampleLevel(tD, sR, vec2f((lp.x + lp.z) * .22, lp.y * 1.1), clamp(log2(max(dist, .25)), 0., 7.));
+      bk = mix(vec3f(.80, .78, .72), vec3f(.08, .07, .065), ss(.60, .66, Wh.a) * .9) * (.85 + .25 * Wh.b);
+    }
+    if (kind == 5) { bk = mix(vec3f(.16, .15, .14), vec3f(.48, .46, .42), fur); }
+    alb = bk * (.6 + .6 * B.b);
+    let isLog = f32(kind == 8);
+    alb = mix(alb, vec3f(.42, .39, .34) * (.55 + .6 * Wd.b) * (.7 + .4 * C.b), ss(.44, .52, B.a * .55 + C.a * .5) * isLog);
+    let patchy = select(ss(.44, .62, B.a * .5 + C.a * .5), ss(.3, .44, B.a * .45 + C.a * .55), kind == 8);
+    alb = mix(alb, mix(mossC, vec3f(.10, .13, .04) * (.5 + .9 * C.b), .45 * isLog), l.k.y * patchy * .88);
+    alb = mix(alb, vec3f(.50, .40, .26) * (.6 + .5 * C.b), ss(.3, .2, abs(l.ao)));
+    alb = mix(alb, vec3f(.05, .03, .02), ss(.11, .03, abs(l.ao)) * f32(kind >= 8));
+  } else if (mat == 3) {
+    // timber (fs's): each piece's shade and the way its grain runs from aux; grey where the sky sees it, browner
+    // where sheltered, its end faces the palest; the boat painted
+    let code = i32(abs(l.ao) * 127. + .5); let tone = f32(code / 16) / 7.; let dk = code % 16; let root = sd >= 1.;
+    let da = (f32(dk) + .5) / 15. * TAU * .5; let dir = vec3f(cos(da), 0., sin(da)); let upr = dk == 15 || root;
+    let along = select(dot(l.wp, dir), l.wp.y, upr);
+    let across = select(dot(l.wp.xz, vec2f(-dir.z, dir.x)) + l.wp.y, l.wp.x + l.wp.z, upr);
+    let wg = textureSampleLevel(tD, sR, vec2f(across * 6., along * .28 + tone * 5.), clamp(2. + log2(max(dist, .25)), 0., 7.));
+    let endF = select(abs(dot(n0, dir)), abs(n0.y), upr) * f32(!root);
+    let sky = ss(-.4, .5, n0.y);
+    alb = mix(mix(vec3f(.12, .085, .055), vec3f(.36, .27, .18), wg.b), mix(vec3f(.25, .245, .23), vec3f(.62, .61, .57), wg.b), sat(.3 + .55 * sky + (tone - .5) * .7) * f32(!root)) * (.7 + .45 * tone) * (.7 + .5 * B.b);
+    if (sd < -50.) {
+      let paint = select(vec3f(.15, .27, .2), vec3f(.06, .07, .06), tone < .3);
+      let outside = max(step(0., fl_), step(tone, .3));
+      alb = mix(alb * mix(.6, 1., outside), paint * (.75 + .5 * C.b), outside * (1. - .75 * ss(.5, .75, wg.b * .55 + B.a * .5)) * step(.1, abs(tone - .43)));
+    }
+    alb = mix(alb, vec3f(.56, .52, .44) * (.7 + .4 * C.b), ss(.75, .95, endF) * .7);
+    alb = mix(alb, mossC, ss(.62, .8, B.a * .6 + C.a * .5) * l.k.y * .55);
+  } else if (mat == 4) {
+    // mushrooms: red with white dots, brown, orange or white by the seed
+    let hue = fract(sd * 7.31);
+    var cap = vec3f(.62, .06, .03);
+    if (hue > .4) { cap = vec3f(.42, .24, .10); }
+    if (hue > .7) { cap = vec3f(.85, .50, .08); }
+    if (hue > .9) { cap = vec3f(.80, .78, .70); }
+    cap = mix(cap, vec3f(.9), ss(.62, .7, C.a) * f32(hue <= .4));
+    alb = mix(vec3f(.78, .74, .64), cap, ss(.3, .6, l.ao)) * (.6 + .5 * B.b);
+  } else {
+    // a deer (fs's coat; its eyes dark)
+    alb = mix(deerCoat(i32(sd) - 8, lp / ts, on, l.ao, fract(sd), B.b * .5 + C.b * .5).rgb, vec3f(.012), ss(-.2, -.7, l.ao));
+  }
+  // where it meets the ground a little of the ground's moss (not on timber), then the darkening: there, by a stream,
+  // in the rain
+  alb = mix(alb, mossC * .6, l.k.z * .3 * f32(mat != 3)) * l.k.x;
+  let c = alb * l.lit;
+  if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(-1., 0., 0., 1.); } // (debug.isolate's mask: W_POST)
+  return fin(c * l.fog.a + l.fog.rgb);
 }
 `;
 
@@ -881,9 +1084,8 @@ ${DEER_WGSL}
 // a bough, a limb's end), the same at every distance, and near the walker the branchlets or leaf clusters of its
 // picture turn out of it (vsN). Nothing changes its shape with distance: cards only thin out by rank (thin), and where a tree's have
 // thinned away one picture of its whole crown stands in (vsFar)
-export const W_LEAF =
-  S_B +
-  /*wgsl*/ `
+// what W_LEAF and W_LEAF_LOW share: the card's layout, its type, curve, light normal and thinning
+const LEAF_HEAD = /*wgsl*/ `
 override ROWS: f32 = 7.;
 // How a store thins with distance (thin): STORE 1 by the trees' distances, 2 by the shrubs' (g.lt, g.ls); 0 by its
 // own, from PD1 to PD2 metres and ending within the last fifth of FAR. The share kept goes from K0 down to KMIN
@@ -899,6 +1101,7 @@ const NEAR_D = ${NEAR_D.toFixed(1)}; // quality.js
 @group(0) @binding(12) var<uniform> lay: array<vec4f, ${PICS.length * SLOTS * 2}>;
 const SLOTS = ${SLOTS}u;
 const STEM_B = vec4f(${STEM_B.map(f).join(', ')}); const STEM_T = vec4f(${STEM_T.map(f).join(', ')}); const STEM_W = ${f(STEM_W)};
+const LTIP = array<vec2f, ${LIMB_TIPS.length}>(${LIMB_TIPS.map((t) => `vec2f(${t.map(f).join(', ')})`).join(', ')});
 struct LI { @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f };
 // pr: how much light passes through, the pattern cut out of the quad (fs: 7 a picture of the atlas), how often it
 // repeats along it (for 7: the atlas's layer), the tree's kind
@@ -908,7 +1111,8 @@ struct LO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n
   // from above (vsN), z and w: a sub-card's own picture's layer (-1 none, 3 bare wood) and how far it has turned
   // out of its card, or a far picture's opacity (vsFar); ou: where its own picture is in the atlas
   @location(6) @interpolate(flat) at: vec4f, @location(7) @interpolate(flat) fx: vec4f, @location(8) ou: vec2f };
-fn shape2(v: f32) -> f32 { return sin(3.14159 * sat(v)); }
+// a place not finite or absurdly far is put outside the clip volume, as isoOut's are (insurance against a bad card)
+fn clipAt(p: vec3f) -> vec4f { return select(vec4f(0., 0., 2., 1.), g.vp * vec4f(p, 1.), all(abs(p) < vec3f(1e6))); }
 fn h4(x: f32) -> vec4f { return fract(sin(vec4f(x, x + 1.7, x + 3.1, x + 5.3) * vec4f(127.1, 269.5, 419.2, 371.9)) * 43758.5453); }
 // What a card's type says: colour, how much light passes through, outline (where it is widest, how blunt), how
 // much it waves, flutters and twists, the pattern cut out of it far off (pat: 1 needle twigs, 2 a spread of small
@@ -980,10 +1184,11 @@ fn thinD() -> vec4f {
 }
 // How a store thins with distance: the cards of the highest ranks narrow away one by one, each at its own distance
 // (K0 1.25: none before the thinning begins), then each that is left ends at its own distance within the band.
-// Nothing grows, nothing drops out in blocks or at a line. This card's width times (scene.js thinW mirrors it)
+// Nothing grows, nothing drops out in blocks or at a line. The share kept is times the Try knob's (g.kn: the trees'
+// or the plants'). This card's width times (scene.js thinW mirrors it)
 fn thin(rank: f32, cd: f32) -> f32 {
   let d = thinD();
-  let k = mix(K0, KMIN, ss(d.x, d.y, cd));
+  let k = mix(K0, KMIN, ss(d.x, d.y, cd)) * select(g.kn.y, g.kn.x, STORE == 1u);
   let r = sqrt(d.z / d.w); let end = d.w * mix(r, 1., hs(rank * 31.7));
   return sat((k - rank) / (.2 * k)) * (1. - ss(end * r, end, cd));
 }
@@ -991,34 +1196,6 @@ fn thin(rank: f32, cd: f32) -> f32 {
 fn cell4(n: i32) -> vec4f { return vec4f(f32(n % 4) * .25, f32(n / 4) * .25, .25, .25); }
 // is this a card of a tree or a shrub, which stands as quads (vsN)? Not in the shadow pass: there all are strips
 fn solidK(y: TY, hA: f32) -> f32 { return y.grow * step(.01, hA) * step(.5, g.res.x); }
-@vertex fn vs(@builtin(vertex_index) vi: u32, i: LI) -> LO {
-  var o: LO;
-  if (isoOut(i.a.xyz) || isoSkip(false)) { o.cp = vec4f(0., 0., 2., 1.); return o; }
-  let u = f32(vi & 1u) * 2. - 1.; let v = sin(f32(vi >> 1u) / (ROWS - 1.) * 1.5708);
-  let ty = i32(i.c.x * 255. + .5); let s1 = i.c.y; let s2 = i.c.z;
-  let t = g.cam.w; let hA = i.b.w;
-  let y = typeOf(ty, s1, s2);
-  let shp_ = g.res.x == 0.;
-  // th: thinned by its rank at this distance; in the shadow pass every card stands whole
-  let th = select(thin(rankOf(i), distance(i.a.xyz, g.cam.xyz)) * (1. - solidK(y, hA)), 1., shp_);
-  let cv = curve(i, y, v, t, i.a.w);
-  let shape = select(pow(max(sin(3.14159 * pow(v, y.shp.x)), 0.), y.shp.y), 1. - .75 * v, ty == 8);
-  // (a bare limb or stem turns to face the walker, so it reads as round from every side)
-  var S = cv.S; var own = normalize(cv.N2 + cv.S * u * .55);
-  if (ty == 8 && !shp_) { S = normalize(cross(cv.T0, cv.c - g.cam.xyz)); own = normalize(S * u * .8 - cross(S, cv.T0)); }
-  var p = cv.c + S * (u * select(i.b.z * .5 * shape * th, select(max(i.b.z * .5, .09) * shape, 0., ty == 1), shp_));
-  // hA: how high up its tree the leaf is rooted, so it rides the trunk's bend (sway in S_B)
-  let sw = sway(i.a.xz, hA + (p.y - i.a.y), t);
-  p.x += sw.x; p.z += sw.y;
-  o.cp = g.vp * vec4f(p, 1.); o.wp = p; o.n = litN(cv, y, hA, own, .35); o.uv = vec2f(u, v);
-  // A fern's frond and a herb's leaves are pictures of the atlas (atlas.js): one of four fronds, a cluster of the
-  // herb's kind of leaf
-  var pat = 0.; let kd = i32(y.kind + .5);
-  if (ty == 2) { pat = 7.; o.at = vec4f(.75 + floor(s2 * 3.99) * .0625, .5, .0625, .25); }
-  else if (y.pat > 1.5) { pat = 7.; o.at = cell4(select(select(4, 6, kd == 3) + i32(step(.5, s2)), 8, kd == 4)); }
-  o.col = y.col; o.pr = vec4f(y.tl, pat, 0., y.kind); o.sd = vec2f(s1, s2); o.fx = vec4f(0., 1., -1., 0.);
-  return o;
-}
 // The flat part of a card a sub-card lies on (a half of a sheet, or one of a limb end's two quads), by its
 // picture's units: o the picture's (0, 0), x and y a unit across and along, f its face's normal, nb and nt the
 // normal it is lit by at the picture's y 0 and 1, fy its fx.y (seen from underneath), sd and cf its seed (o.sd.y)
@@ -1039,22 +1216,38 @@ fn sheetPF(i: LI, y: TY, t: f32, len: f32, wd: f32, h: f32, yS: f32) -> PF {
   o.sd = i.c.z; o.cf = 1.;
   return o;
 }
-// quad kq of a limb's end: about the card's line, turned its own way, with a little flutter of its own; a bush's
-// lie level, along the card, in tiers
-fn limbPF(i: LI, y: TY, t: f32, len: f32, show: f32, kq: f32) -> PF {
+// quad kq of a limb's end: a tuft of three twigs from one foot (sprigs.js limbEnd: the picture's (0.5, 0.03)), turned
+// its own way, with a little flutter of its own; le: its picture's atlas cell (6-10). A tree's first foot is the
+// card's root, which world.js lays on its limb, and its second the end of the first's middle twig (LTIP), so every
+// twig grows from wood; a bush's lie level, along the card, in tiers
+struct TF { axis: vec3f, wide: vec3f, L: f32, W: f32, cv: CV, h: vec4f, hb: vec4f };
+fn tuftOf(i: LI, y: TY, t: f32, len: f32, show: f32, kq: f32) -> TF {
+  var o: TF;
+  let s2 = i.c.z; o.h = h4(s2 * 91.7 + kq * 17.31); o.hb = h4(s2 * 53.1 + kq * 7.77);
+  o.cv = curve(i, y, (kq + .6) / 2.2, t, len);
+  let r3 = normalize(o.h.yzw - .5 + vec3f(0., .15, 0.));
+  o.axis = normalize(r3 + o.cv.T0 * .5 + vec3f(0., .3, 0.));
+  o.L = clamp(len * 1.1, .5, 2.3);
+  o.wide = normalize(cross(o.axis, o.hb.yzw - .5 + vec3f(.013, .007, .011)));
+  if (y.lay > .5) { o.axis = normalize(o.cv.T0 + r3 * .22); o.wide = normalize(cross(vec3f(0., 1., 0.) + (o.hb.yzw - .5) * .35, o.axis)); o.L *= .7; }
+  o.axis = normalize(o.axis + o.wide * (sin(t * (1.3 + o.hb.z * 2.) + o.h.w * 40.) * .07 * (.4 + g.wx.y)));
+  o.W = o.L * .5 * show;
+  return o;
+}
+fn limbPF(i: LI, y: TY, t: f32, len: f32, show: f32, kq: f32, le: i32) -> PF {
   var o: PF;
-  let s2 = i.c.z; let h = h4(s2 * 91.7 + kq * 17.31); let hb = h4(s2 * 53.1 + kq * 7.77);
-  let cv = curve(i, y, (kq + .6) / 2.2, t, len);
-  let r3 = normalize(h.yzw - .5 + vec3f(0., .15, 0.));
-  var axis = normalize(r3 + cv.T0 * .5 + vec3f(0., .3, 0.));
-  var L = clamp(len * 1.1, .5, 2.3);
-  var wide = normalize(cross(axis, hb.yzw - .5 + vec3f(.013, .007, .011)));
-  if (y.lay > .5) { axis = normalize(cv.T0 + r3 * .22); wide = normalize(cross(vec3f(0., 1., 0.) + (hb.yzw - .5) * .35, axis)); L *= .7; }
-  axis = normalize(axis + wide * (sin(t * (1.3 + hb.z * 2.) + h.w * 40.) * .07 * (.4 + g.wx.y)));
-  let W = L * .5 * show;
-  o.x = wide * (2. * W); o.y = axis * L; o.o = cv.c - axis * (L * .3) - wide * W;
-  o.f = normalize(cross(wide, axis)); o.nb = litN(cv, y, i.b.w, o.f, .5); o.nt = o.nb;
-  o.fy = 1.; o.sd = fract(s2 + h.x * 7.31); o.cf = .8 + .4 * hb.w;
+  let a = tuftOf(i, y, t, len, show, kq);
+  var foot = a.cv.c - a.axis * (a.L * .27);
+  if (y.lay < .5) {
+    foot = i.a.xyz;
+    if (kq > .5) {
+      let b = tuftOf(i, y, t, len, show, 0.); let tip = LTIP[clamp(le - 6, 0, ${LIMB_TIPS.length - 1})];
+      foot += b.axis * (b.L * (tip.y - .03)) + b.wide * (2. * b.W * (tip.x - .5));
+    }
+  }
+  o.x = a.wide * (2. * a.W); o.y = a.axis * a.L; o.o = foot - a.axis * (a.L * .03) - a.wide * a.W;
+  o.f = normalize(cross(a.wide, a.axis)); o.nb = litN(a.cv, y, i.b.w, o.f, .5); o.nt = o.nb;
+  o.fy = 1.; o.sd = fract(i.c.z + a.h.x * 7.31); o.cf = .8 + .4 * a.hb.w;
   return o;
 }
 // v turned by the least turn that takes the way a to the way b, then by r about b
@@ -1062,6 +1255,40 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
   let k = cross(a, b);
   let u = v * dot(a, b) + cross(k, v) + k * (dot(k, v) / (1. + dot(a, b)));
   return u * cos(r) + cross(b, u) * sin(r) + b * (dot(b, u) * (1. - cos(r)));
+}
+`;
+export const W_LEAF =
+  S_B +
+  LEAF_HEAD +
+  /*wgsl*/ `
+@vertex fn vs(@builtin(vertex_index) vi: u32, i: LI) -> LO {
+  var o: LO;
+  if (isoOut(i.a.xyz) || isoSkip(false)) { o.cp = vec4f(0., 0., 2., 1.); return o; }
+  let u = f32(vi & 1u) * 2. - 1.; let v = sin(f32(vi >> 1u) / (ROWS - 1.) * 1.5708);
+  let ty = i32(i.c.x * 255. + .5); let s1 = i.c.y; let s2 = i.c.z;
+  let t = g.cam.w; let hA = i.b.w;
+  let y = typeOf(ty, s1, s2);
+  let shp_ = g.res.x == 0.;
+  // th: thinned by its rank at this distance; in the shadow pass every card stands whole
+  let th = select(thin(rankOf(i), distance(i.a.xyz, g.cam.xyz)) * (1. - solidK(y, hA)), 1., shp_);
+  let cv = curve(i, y, v, t, i.a.w);
+  let shape = select(pow(max(sin(3.14159 * pow(v, y.shp.x)), 0.), y.shp.y), 1. - .75 * v, ty == 8);
+  // (a bare limb or stem turns to face the walker, so it reads as round from every side)
+  var S = cv.S; var own = normalize(cv.N2 + cv.S * u * .55);
+  if (ty == 8 && !shp_) { S = normalize(cross(cv.T0, cv.c - g.cam.xyz)); own = normalize(S * u * .8 - cross(S, cv.T0)); }
+  var p = cv.c + S * (u * select(i.b.z * .5 * shape * th, select(max(i.b.z * .5, .09) * shape, 0., ty == 1), shp_));
+  // hA: how high up its tree the leaf is rooted, so it rides the trunk's bend (sway in S_B). A bare limb sways by
+  // each point of its line, so a card rooted on it, swaying by its root, moves with it
+  let sw = sway(select(i.a.xz, cv.c.xz, ty == 8), hA + (p.y - i.a.y), t);
+  p.x += sw.x; p.z += sw.y;
+  o.cp = clipAt(p); o.wp = p; o.n = litN(cv, y, hA, own, .35); o.uv = vec2f(u, v);
+  // A fern's frond and a herb's leaves are pictures of the atlas (atlas.js): one of four fronds, a cluster of the
+  // herb's kind of leaf
+  var pat = 0.; let kd = i32(y.kind + .5);
+  if (ty == 2) { pat = 7.; o.at = vec4f(.75 + floor(s2 * 3.99) * .0625, .5, .0625, .25); }
+  else if (y.pat > 1.5) { pat = 7.; o.at = cell4(select(select(4, 6, kd == 3) + i32(step(.5, s2)), 8, kd == 4)); }
+  o.col = y.col; o.pr = vec4f(y.tl, pat, 0., y.kind); o.sd = vec2f(s1, s2); o.fx = vec4f(0., 1., -1., 0.);
+  return o;
 }
 // A card of a tree or a shrub, as quads of six vertices, each showing a picture of the foliage atlas. The first
 // two are the card itself and stay as they are at every distance: a bough is a sheet in two flat lengths along its
@@ -1118,7 +1345,7 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
       let own = normalize(cross(wide, axis)); o.n = litN(cv, y, hA, own, .5); ft = own;
       o.sd.y = fract(s2 + h.x * 7.31); o.col = y.col * (.8 + .4 * hb.w);
     } else {
-      let pf = limbPF(i, y, t, len, show, f32(k));
+      let pf = limbPF(i, y, t, len, show, f32(k), le);
       p = pf.o + pf.x * ((q.x + 1.) * .5) + pf.y * q.y;
       o.n = pf.nb; o.sd.y = pf.sd; o.col = y.col * pf.cf;
     }
@@ -1128,7 +1355,7 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
     if (e.w <= 0.) { return o; }
     let h = h4(s2 * 91.7 + f32(k) * 17.31); let hb = h4(s2 * 53.1 + f32(k) * 7.77);
     var pf: PF;
-    if (sheet) { pf = sheetPF(i, y, t, len, wd, e2.z, yS); } else { pf = limbPF(i, y, t, len, show, e2.z); }
+    if (sheet) { pf = sheetPF(i, y, t, len, wd, e2.z, yS); } else { pf = limbPF(i, y, t, len, show, e2.z, le); }
     let dir = vec2f(-sin(e.z), cos(e.z)); let acr = vec2f(dir.y, -dir.x) * (abs(e2.x) * .5);
     let pp = e.xy + dir * (q.y * e.w) + acr * q.x;
     let A = pf.x * (dir.x * e.w) + pf.y * (dir.y * e.w); let B = pf.x * acr.x + pf.y * acr.y;
@@ -1165,7 +1392,7 @@ fn turn(v: vec3f, a: vec3f, b: vec3f, r: f32) -> vec3f {
   }
   let sw = sway(i.a.xz, hA + (p.y - i.a.y), t);
   p.x += sw.x; p.z += sw.y;
-  o.cp = g.vp * vec4f(p, 1.); o.wp = p;
+  o.cp = clipAt(p); o.wp = p;
   // (a conifer's spray seen from underneath shows its shaded side: fx.y 0, and 1 seen from above)
   let under = select(1., ss(-.15, .15, dot(ft * sign(ft.y + 1e-4), normalize(g.cam.xyz - p))), conifer);
   if (k >= 2u) {
@@ -1195,29 +1422,9 @@ const FARKIND = array<f32, 8>(0., 0., 0., 1., 6., 2., 3., 4.);
   let kd = FARKIND[i32(pic)];
   o.col = folC(i32(kd), s1, s2) * .85; o.sd = vec2f(s1, s2);
   o.pr = vec4f(.3, 7., 2., kd); o.at = vec4f(pic * .125, .5, .125, .25); o.fx = vec4f(0., 1., -1., inK);
-  o.cp = g.vp * vec4f(p, 1.); o.wp = p;
+  o.cp = clipAt(p); o.wp = p;
   o.n = normalize(vec3f(g.cam.x - i.a.x, 0., g.cam.z - i.a.z)) * .6 + vec3f(0., .8, 0.);
   return o;
-}
-// fireflies: a = place + height (for the sway), b = seed, colour, size
-struct GO { @builtin(position) cp: vec4f, @location(0) uv: vec2f, @location(1) @interpolate(flat) col: vec3f };
-@vertex fn vsGl(@builtin(vertex_index) vi: u32, @location(0) a: vec4f, @location(1) b: vec4f) -> GO {
-  var o: GO; let q = vec2f(f32(vi & 1u), f32(vi >> 1u)) * 2. - 1.; let t = g.cam.w;
-  let p = a.xyz + vec3f(sin(t * .31 + b.x * 50.), .5 * sin(t * .43 + b.x * 70.), cos(t * .37 + b.x * 90.)) * .9;
-  let d = length(p - g.cam.xyz);
-  if (d > 90. || dot(p - g.cam.xyz, g.fwd.xyz) < -1.) { o.cp = vec4f(0., 0., 2., 1.); o.uv = q; o.col = vec3f(0.); return o; }
-  let tw = pow(.5 + .5 * sin(t * (.9 + 1.4 * hs(b.x)) + b.x * 100.), 6.);
-  let sz = min(max(b.z, d * .0026), d * .0045);
-  let w = p + (g.right.xyz * q.x + g.up.xyz * q.y) * sz;
-  o.cp = g.vp * vec4f(w, 1.); o.uv = q;
-  let e = b.z / sz;
-  // brightest in the shade, out in the rain
-  o.col = mix(vec3f(1., .78, .2), vec3f(.75, 1., .3), b.y) * (.05 + tw * 2.2) * e * e * hazeT(d, 0., p.y) * ss(.4, 1.5, d) * (14. - 9. * shadowV(p)) * (1. - .85 * g.wx.z);
-  return o;
-}
-@fragment fn fsGl(i: GO) -> @location(0) vec4f {
-  let r = dot(i.uv, i.uv);
-  return vec4f(min(i.col * exp(-r * 7.) * (1. - ss(.7, 1., r)), vec3f(10.)), 0.);
 }
 // A card's colour (fs), or a far tree's picture blended in (fsFar: its whole outline a pixel soft, times fx.w)
 @fragment fn fs(i: LO, @builtin(front_facing) ff: bool) -> @location(0) vec4f { return leafC(i, ff, false); }
@@ -1294,168 +1501,167 @@ fn leafC(i: LO, ff: bool, blended: bool) -> vec4f {
 }
 `;
 
-// ---------------------------------------------------------------- flyers: butterflies and small birds in flocks, big birds soaring
-// A flock member: a = the flock's centre + lap radius, b = its seed, turn rate, size, the flock's seed
+// ---------------------------------------------------------------- the Low tier's leaves and plants
+// Low (quality.js) draws every card and strip lighter. A tree's or a shrub's card is its first two quads only (no
+// sub-cards near the walker), drawn indexed (eight corners: scene.js ibQuads); a strip (fern, grass, herb, limb) as
+// vs draws it. Nothing moves in the wind (the trunks stand still too at Low: kn.w). Each card's light comes from its
+// record (lr: W_LEAF_LIGHT at load: the sun's share past the shadow, with the dapple's mean, the sky's, the
+// openness) and is worked out per vertex, with the fog; fsL reads the atlas once and cuts
+export const W_LEAF_LOW =
+  S_B +
+  LEAF_HEAD +
+  /*wgsl*/ `
+// pr: the atlas layer, the pattern (7 a picture), the kind, the leaves' colour times (fs's i.col.g over folC's);
+// nf: needles darker seen from right below (fs's)
+struct LL { @builtin(position) cp: vec4f, @location(0) auv: vec2f, @location(1) lit: vec3f, @location(2) fog: vec4f,
+  @location(3) @interpolate(flat) col: vec3f, @location(4) @interpolate(flat) pr: vec4f,
+  @location(5) @interpolate(flat) sd: vec2f, @location(6) nf: f32 };
+// amb by up² of the normal (its colours once)
+fn ambU(u2: f32, sky: f32) -> vec3f {
+  let top = mix(vec3f(.40, .50, .74), vec3f(.52, .55, .60), g.sun.w) + flashL(vec3f(0., 1., 0.)) * .05;
+  let low = mix(vec3f(.24, .23, .09), vec3f(.17, .17, .13), g.sun.w);
+  return (mix(low, top, u2) * (.42 + .58 * sky) * .8 + vec3f(.085, .075, .05) * (1. - sky) * (1. - .6 * g.sun.w)) * (1. - .3 * g.st.x);
+}
+// fs's light at a card's corner: n its light normal, uvy how far along it, under: a conifer's spray seen from below
+fn litL(p: vec3f, n: vec3f, lr: vec4f, tl: f32, uvy: f32, under: f32) -> vec3f {
+  let E = sunE() * lr.r; let L = g.sun.xyz; let ndl = dot(n, L);
+  let aov = sat((lr.b - .5) * 6.) * mix(.45, 1., uvy);
+  // (amb for n and for -n, its colours worked out once)
+  let up = n.y * .5 + .5; let down = 1. - up;
+  let am = (ambU(up * up, lr.g) + ambU(down * down, lr.g) * tl * .25 + side(n, sat((lr.b - .5) * 4.)) * .6) * (.35 + .65 * aov);
+  let warm = mix(vec3f(1.), vec3f(1.5, 1.25, .7), tl);
+  let V = normalize(g.cam.xyz - p);
+  let lit = E * (max(ndl, 0.) + warm * (max(-ndl, 0.) * .4 + .04) * tl) * (1. - .75 * under) + am * (1. - .4 * under)
+    + E * warm * tl * pow(sat(dot(-V, L)), 5.) * .8;
+  // (fs's shade along the card and its mean across it; wet, darker)
+  return lit * mix(.48, 1.15, uvy) * .97 * (1. - .25 * g.wx.x);
+}
+fn endL(p: vec3f, n: vec3f, uv: vec2f, at: vec4f, lr: vec4f, y: TY, col: vec3f, sd: vec2f, layer: f32, pat: f32, under: f32) -> LL {
+  var o: LL;
+  o.cp = clipAt(p); o.auv = at.xy + vec2f(uv.x * .5 + .5, uv.y) * at.zw;
+  o.lit = litL(p, n, lr, y.tl, uv.y, under); o.fog = fogParts(p);
+  let kd = i32(y.kind + .5);
+  o.col = col; o.sd = sd;
+  o.pr = vec4f(layer, pat, y.kind, col.g / max(folC(kd, sd.x, sd.y).g, 1e-3));
+  o.nf = mix(.4, 1.1, ss(-.75, .15, normalize(g.cam.xyz - p).y));
+  return o;
+}
+// a card of a tree or a shrub: corner vi % 4 of quad vi / 4 (vsN's first two, still)
+@vertex fn vsNL(@builtin(vertex_index) vi: u32, i: LI, @location(3) lr: vec4f) -> LL {
+  let ty = i32(i.c.x * 255. + .5); let s1 = i.c.y; let s2 = i.c.z; let len = i.a.w; let hA = i.b.w;
+  let y = typeOf(ty, s1, s2);
+  let show = solidK(y, hA) * thin(rankOf(i), distance(i.a.xyz, g.cam.xyz));
+  var o: LL; o.cp = vec4f(0., 0., 2., 1.);
+  if (show <= 0. || isoOut(i.a.xyz) || isoSkip(false)) { return o; }
+  let k = vi / 4u; let cn = vi % 4u; let q = vec2f(f32(cn & 1u) * 2. - 1., f32(cn >> 1u));
+  let conifer = y.pat < 1.5; let kd = i32(y.kind + .5); let alt = i32(step(.5, hs(s2 * 13.7)));
+  let br = select(select(select(alt, 4, kd == 1), 2 + alt, kd == 5), 5, kd == 7);
+  let bo = select(select(alt, 3, kd == 1), 2, kd == 5);
+  let le = select(select(select(6 + alt, 8, kd == 3), 9, kd == 4), 10, y.lay > .5);
+  let isLong = len > 2.2 || ty == 9; let sheet = conifer && ty != 6;
+  var layer = 1.; var at = cell4(le); var yS = 1.;
+  if (sheet) { layer = select(1., 2., isLong); yS = select(1., .5, isLong); at = select(cell4(br), vec4f(f32(bo) * .25, 0., .25, .5), isLong); }
+  else if (conifer) { at = cell4(br); }
+  let wd = i.b.z * .5 * show;
+  var p: vec3f; var n: vec3f; var uv = q; var col = y.col; var sd = vec2f(s1, s2); var under = 0.;
+  if (sheet) {
+    // a half of a bough's sheet, flat: a rig sheet's twist is the same all along it, so each edge's own frame
+    let v = (f32(k) + q.y) * .5; let cv = curve(i, y, v, 0., len);
+    p = cv.c + cv.S * (q.x * wd); n = litN(cv, y, hA, cv.N2, .5); uv = vec2f(q.x, v);
+    under = 1. - ss(-.15, .15, dot(cv.N2 * sign(cv.N2.y + 1e-4), normalize(g.cam.xyz - p)));
+  } else if (conifer) {
+    // a hanging spray: two quads across each other down its line
+    let h = h4(s2 * 91.7 + f32(k) * 17.31); let hb = h4(s2 * 53.1 + f32(k) * 7.77);
+    let cv = curve(i, y, 0., 0., len); let tip = curve(i, y, 1., 0., len).c;
+    let ax = normalize(tip - cv.c); let wide = normalize(cross(ax, select(cv.S, cv.N2, k == 0u)));
+    p = cv.c + ax * (q.y * length(tip - cv.c)) + wide * (q.x * wd);
+    let own = normalize(cross(wide, ax)); n = litN(cv, y, hA, own, .5);
+    sd.y = fract(s2 + h.x * 7.31); col = y.col * (.8 + .4 * hb.w);
+    under = 1. - ss(-.15, .15, dot(own * sign(own.y + 1e-4), normalize(g.cam.xyz - p)));
+  } else {
+    let pf = limbPF(i, y, 0., len, show, f32(k), le);
+    p = pf.o + pf.x * ((q.x + 1.) * .5) + pf.y * q.y; n = pf.nb; sd.y = pf.sd; col = y.col * pf.cf;
+  }
+  return endL(p, n, uv, at, lr, y, col, sd, layer, 7., under);
+}
+// a strip: a plant of the ground (fern, grass, herb) or a bare limb (vs, still)
+@vertex fn vsL(@builtin(vertex_index) vi: u32, i: LI, @location(3) lr: vec4f) -> LL {
+  var o: LL; o.cp = vec4f(0., 0., 2., 1.);
+  if (isoOut(i.a.xyz) || isoSkip(false)) { return o; }
+  let u = f32(vi & 1u) * 2. - 1.; let v = sin(f32(vi >> 1u) / (ROWS - 1.) * 1.5708);
+  let ty = i32(i.c.x * 255. + .5); let s1 = i.c.y; let s2 = i.c.z; let hA = i.b.w;
+  let y = typeOf(ty, s1, s2);
+  let th = thin(rankOf(i), distance(i.a.xyz, g.cam.xyz)) * (1. - solidK(y, hA));
+  let cv = curve(i, y, v, 0., i.a.w);
+  let shape = select(pow(max(sin(3.14159 * pow(v, y.shp.x)), 0.), y.shp.y), 1. - .75 * v, ty == 8);
+  var S = cv.S; var own = normalize(cv.N2 + cv.S * u * .55);
+  if (ty == 8) { S = normalize(cross(cv.T0, cv.c - g.cam.xyz)); own = normalize(S * u * .8 - cross(S, cv.T0)); }
+  let p = cv.c + S * (u * i.b.z * .5 * shape * th);
+  var pat = 0.; var at = vec4f(0., 0., .0625, .25); let kd = i32(y.kind + .5);
+  if (ty == 2) { pat = 7.; at = vec4f(.75 + floor(s2 * 3.99) * .0625, .5, .0625, .25); }
+  else if (y.pat > 1.5) { pat = 7.; at = cell4(select(select(4, 6, kd == 3) + i32(step(.5, s2)), 8, kd == 4)); }
+  return endL(p, litN(cv, y, hA, own, .35), vec2f(u, v), at, lr, y, y.col, vec2f(s1, s2), 0., pat, 0.);
+}
+// fs at Low: one read of the atlas, the cut, the colour (fs's), the light and fog from the vertex
+@fragment fn fsL(i: LL, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+  let tx = textureSample(tF, sR, i.auv, i32(i.pr.x + .5));
+  let alod = log2(max(max(fwidth(i.auv.x), fwidth(i.auv.y)) * ${ATLAS}., 1.));
+  var base = i.col; var cut = 1.;
+  if (i.pr.y > 6.5) {
+    cut = step(mix(.5, .43, sat(alod / 3.)), tx.a);
+    let kd = i32(i.pr.z + .5);
+    if (kd >= 2 && kd <= 4) {
+      base = folC(kd, fract(i.sd.x + (tx.g - .5) * .5 + 1.), i.sd.y) * (.45 + .75 * tx.r) * i.pr.w;
+      if (!ff) { base = mix(base, vec3f(dot(base, vec3f(.36))), .35) * 1.12; }
+    } else {
+      base = mix(i.col, i.col * 1.5 + vec3f(.025, .045, 0.), tx.g * .7) * (.45 + .75 * tx.r) * i.nf;
+    }
+    base = mix(select(vec3f(.15, .12, .085), vec3f(.21, .2, .18), kd == 7) * (.6 + .8 * tx.r), base, tx.b);
+  }
+  if (cut < .5) { discard; }
+  if (g.dbg.w > .5 && g.dbg.w < 1.5) { return vec4f(-1., 0., 0., 1.); }
+  return fin(base * i.lit * i.fog.a + i.fog.rgb);
+}
+`;
+// A Low card's light record (W_LEAF_LOW lr), worked out once at load (scene.js): at the middle of its line, the
+// sun's share past the baked shadow (four reads, as shadow4) times the dapple's mean, and the light volume's sky
+// share and openness, as four bytes. run: the first card and how many
+export const W_LEAF_LIGHT = /*wgsl*/ `
+struct LG { sm: mat4x4f, sun: vec4f, run: vec4u };
+@group(0) @binding(0) var<uniform> lg: LG;
+@group(0) @binding(1) var<storage, read> cards: array<u32>;
+@group(0) @binding(2) var<storage, read_write> lights: array<u32>;
+@group(0) @binding(3) var tSh: texture_depth_2d;
+@group(0) @binding(4) var tV: texture_3d<f32>;
+@group(0) @binding(5) var sC: sampler;
+fn ss(a: f32, b: f32, x: f32) -> f32 { let t = clamp((x - a) / (b - a), 0., 1.); return t * t * (3. - 2. * t); }
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= lg.run.y) { return; }
+  let k = lg.run.x + id.x; let w = k * 9u;
+  let root = vec3f(bitcast<f32>(cards[w]), bitcast<f32>(cards[w + 1u]), bitcast<f32>(cards[w + 2u]));
+  let len = bitcast<f32>(cards[w + 3u]); let yaw = bitcast<f32>(cards[w + 4u]); let tilt = bitcast<f32>(cards[w + 5u]);
+  let p = root + vec3f(sin(tilt) * cos(yaw), cos(tilt), sin(tilt) * sin(yaw)) * len * .5;
+  let s = lg.sm * vec4f(p + lg.sun.xyz * .3, 1.); let uv = vec2f(s.x * .5 + .5, .5 - s.y * .5);
+  let nn = vec2f(textureDimensions(tSh)); var sh = 0.;
+  for (var j = 0; j < 4; j++) {
+    let c = vec2i(clamp(uv * nn + vec2f(f32(j & 1) * 2. - 1., f32(j >> 1) * 2. - 1.) * 1.8, vec2f(0.), nn - 1.));
+    sh += select(0., .25, s.z - .0006 <= textureLoad(tSh, c, 0));
+  }
+  let vv = textureSampleLevel(tV, sC, (p + vec3f(0., .8, 0.) - ${VOL0}) / ${VOLS}, 0.);
+  lights[k] = pack4x8unorm(vec4f(sh * mix(.8, 1., ss(.6, .95, vv.g) * .45), vv.g, vv.r, 1.));
+}
+`;
+
+// ---------------------------------------------------------------- the birds of birds.js (vsJay)
 export const W_ANIM =
   S_B +
   /*wgsl*/ `
-struct VI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) b: vec4f };
-struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f, @location(3) @interpolate(flat) sd: f32, @location(4) lt: f32 };
-@vertex fn vsFish(i: VI) -> VO {
-  var o: VO;
-  let s = i.b.x; let h = vec3f(hs(s), hs(s + .37), hs(s + .71));
-  let R = i.a.w; let t = g.cam.w;
-  let small = step(i.b.z, .2);   // butterflies; the larger ones are birds
-  let ta = t * i.b.y + i.b.w * 6.3 + (h.x - .5) * (26. / R);
-  let ph = i.b.w * 17.;
-  let P = i.a.xyz + vec3f(R * cos(ta), .8 * sin(3. * ta + ph), R * .6 * sin(ta));
-  let T = normalize(vec3f(-R * sin(ta), 2.4 * cos(3. * ta + ph), R * .6 * cos(ta))) * sign(i.b.y);
-  let S = normalize(cross(vec3f(0., 1., 0.), T)); let Up = cross(T, S);
-  let off = S * ((h.y - .5) * R * .9 + sin(t * .6 + s * 40.) * .5) + Up * ((h.z - .5) * mix(2.4, 1.2, small) + cos(t * .5 + s * 31.) * .4 + small * sin(t * 4.3 + s * 60.) * .25);
-  var l = i.p * i.b.z * (.75 + .5 * h.z);
-  // the wings (aux below .5) beat about the body's long axis
-  let beat = sin(t * mix(13., 24., small) + s * 50.) * mix(.75, 1.1, small);
-  if (i.n.w < .5) { l = vec3f(l.x, l.y + abs(l.z) * sin(beat), l.z * cos(beat)); }
-  let w = P + off + T * l.x + Up * l.y + S * l.z;
-  // sd: the colour set in the whole part, the member's own seed in the fraction. The set is the flock's (from its
-  // seed), or with a seed of 1 or more each member's own. Butterflies use sets 0-3, birds 4-7
-  let kind = select(floor(i.b.w * 12.), floor(fract(s * 7.31) * 12.), i.b.w >= 1.) % 4.;
-  o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.n = T * i.n.x + Up * i.n.y + S * i.n.z; o.op = i.p; o.sd = kind + 4. * (1. - small) + s * .999;
-  o.lt = shadowV(w);
-  return o;
-}
-@fragment fn fsFish(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
-  let n = normalize(i.n) * select(-1., 1., ff); let L = g.sun.xyz;
-  let vv = vol(i.wp);
-  let kind = i32(i.sd); let own = fract(i.sd);
-  // 0 orange, 1 white, 2 blue, 3 yellow butterflies; 4 a jay, 5 a robin, 6 and 7 chickadees
-  var belly = vec3f(.85, .42, .05); var back = belly; var tip = vec3f(.03);
-  if (kind == 1) { belly = vec3f(.90, .90, .84); back = belly; tip = vec3f(.3); }
-  if (kind == 2) { belly = vec3f(.20, .42, .90); back = belly; }
-  if (kind == 3) { belly = vec3f(.92, .80, .15); back = belly; tip = vec3f(.25, .15, .02); }
-  if (kind == 4) { belly = vec3f(.12, .26, .60); back = vec3f(.05, .13, .42); }
-  if (kind == 5) { belly = vec3f(.80, .30, .08); back = vec3f(.20, .15, .10); tip = back; }
-  if (kind >= 6) { belly = vec3f(.70, .68, .62); back = vec3f(.22, .22, .24); }
-  var alb = mix(mix(belly, back, ss(-.1, .5, n.y)), tip, ss(.30, .46, abs(i.op.z))) * (.85 + .3 * own);
-  let E = sunE() * i.lt; let ndl = dot(n, L);
-  let c = alb * (E * (.3 + .7 * sat(ndl) + .5 * sat(-ndl)) + amb(n, vv.g) * 1.3);
-  return fin(fog(c, i.wp));
-}
-// A big bird: a = the centre of its lap + radius, b = where on the lap it starts, turn rate, size, seed.
-// Its mesh spans x from -1 to 1 with the head at +z; a vertex's aux is how far out along the wing it is
-@vertex fn vsManta(i: VI) -> VO {
-  var o: VO;
-  let t = g.cam.w; let R = i.a.w; let sz = i.b.z;
-  let ta = t * i.b.y + i.b.x;
-  let P = i.a.xyz + vec3f(R * cos(ta), 2.5 * sin(2. * ta + i.b.w), R * .75 * sin(ta));
-  let T = normalize(vec3f(-R * sin(ta), 5. * cos(2. * ta + i.b.w), R * .75 * cos(ta))) * sign(i.b.y);
-  var S = normalize(cross(vec3f(0., 1., 0.), T)); var Up = cross(T, S);
-  let bank = -.28 * sign(i.b.y);
-  let S2 = S * cos(bank) + Up * sin(bank); Up = Up * cos(bank) - S * sin(bank); S = S2;
-  let u = i.n.w; let au = abs(u);
-  // a few beats, then a glide
-  let fp = t * 4.2 + i.b.w * 5. - au * 1.2;
-  let amp = .36 * pow(au, 1.6) * (.2 + .8 * ss(-.2, .5, sin(t * .35 + i.b.w * 9.)));
-  var l = i.p;
-  l.y += amp * sin(fp);
-  let sl = amp * 1.6 * cos(fp) * sign(u);
-  let ln = normalize(vec3f(i.n.x - sl * i.n.y, i.n.y + sl * i.n.x, i.n.z));
-  let w = P + (S * l.x + Up * l.y + T * l.z) * sz;
-  o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.n = S * ln.x + Up * ln.y + T * ln.z; o.op = i.p; o.sd = i.b.w;
-  o.lt = 1.;
-  return o;
-}
-// A bird of birds.js: a = where its feet are and its length, q = its turn, c = its species with its own seed in
-// the fraction; the wings' phase; how far they are spread (2 more in the air); the head's turn (-1 to 1, packed
-// into the fraction) with the tail's fan (fifteenths) in the whole part. The mesh (meshSongbird) has its nose
-// at +z and its feet at the origin; a vertex's aux says what it is: over 0.15 a wing (how far out, signed by
-// side), 0.06 to 0.13 the tail, -0.07 a leg, -0.12 an eye, 0 the body
-const AXIS = .3; // the body's axis over the feet, in lengths (birds.js)
-struct BI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f, @location(3) q: vec4f, @location(4) c: vec4f };
-struct BV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f, @location(3) @interpolate(flat) sd: f32, @location(4) lt: f32, @location(5) aux: f32, @location(6) @interpolate(flat) fan: f32 };
-@vertex fn vsBird(i: BI) -> BV {
-  var o: BV; var l = i.p; var n = i.n.xyz; let aux = i.n.w;
-  let air = step(1.5, i.c.z); let spread = i.c.z - 2. * air;
-  let fan = floor(i.c.w) / 15.; let turn = (fract(i.c.w) - .5) / .45;
-  if (abs(aux) > .15) {
-    // A wing: its inner half swings about the shoulder, its outer half about the wrist a little behind it, so it
-    // bends: bowed on the way down, folded on the way up, when it is also drawn in by a quarter. Shut, it is
-    // drawn into the body (the folded wing is painted on the flank). Lit by the body's up, not its own face,
-    // which would flicker with every beat
-    let side = sign(aux); let out = (abs(aux) - .2) / .8; let ph = i.c.y;
-    let a1 = (sin(ph) * .7 + .12) * spread; let a2 = (sin(ph - .9) + .05) * spread;
-    let reach = (abs(l.x) - .07) * spread * (1. - .25 * max(cos(ph), 0.));
-    let inner = reach * min(1., .45 / max(out, .001));
-    l = vec3f(side * (.07 + inner * cos(a1) + (reach - inner) * cos(a2)), l.y + inner * sin(a1) + (reach - inner) * sin(a2), l.z - (1. - spread) * out * .3);
-    n = vec3f(0., 1., 0.);
-  } else if (aux > .04) { l.x *= 1. + 1.6 * fan; }                                        // the tail fans
-  else if (aux < -.04 && aux > -.095) { l.y = mix(l.y, AXIS - .1, air); l.z = mix(l.z, -.08, air); }   // legs tucked up in the air
-  // the head turns about the neck, the bill and the eyes with it
-  let hk = -ss(.2, .3, i.p.z) * turn * 1.3; let hc = cos(hk); let hn = sin(hk); let hz = l.z - .24;
-  l = vec3f(l.x * hc + hz * hn, l.y, .24 + hz * hc - l.x * hn);
-  n = vec3f(n.x * hc + n.z * hn, n.y, n.z * hc - n.x * hn);
-  let w = i.a.xyz + qrot(i.q, l * i.a.w);
-  o.cp = g.vp * vec4f(w, 1.); o.wp = w; o.n = qrot(i.q, n); o.op = i.p; o.sd = i.c.x; o.aux = aux; o.fan = fan;
-  o.lt = shadowV(w + vec3f(0., .04, 0.));
-  return o;
-}
-@fragment fn fsBird(i: BV, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
-  let wing = step(.15, abs(i.aux));
-  let n = normalize(i.n) * mix(select(-1., 1., ff), 1., wing);
-  let p = i.op; let h = p.y - AXIS; let own = fract(i.sd); let sp = i32(i.sd);
-  // By species (birds.js SPECIES): the body by where on it, then what differs: the folded wing's panel on the
-  // flank and where it lies, the bill and where it begins, the open wing, the tail's middle and its outer
-  // feathers, the legs
-  var alb = vec3f(0.); var panel = vec3f(.14, .12, .11); var bill = vec3f(.78, .62, .56); var wingC = vec3f(.15, .13, .12);
-  var tailC = vec3f(.07, .07, .08); var edgeC = tailC; var leg = vec3f(.42, .26, .24); var panelZ = vec2f(-.22, .1); var billZ = .415;
-  if (sp == 0) {
-    // A dark-eyed junco: a dark slate hood over head, neck and breast, cut off sharply against a pale belly; a
-    // browner back, buff flanks, a pink bill; the tail's outer feathers white
-    alb = mix(mix(vec3f(.34, .26, .17), vec3f(.62, .5, .38), ss(0., -.03, h)), vec3f(.86, .84, .8), ss(-.05, -.08, h));
-    alb = mix(alb, vec3f(.1, .105, .12), ss(.075, .095, p.z - h * .25));
-    edgeC = vec3f(.85, .85, .82);
-  } else if (sp == 1) {
-    // A chickadee: black cap and bib, the white cheek between them, grey back, pale below with buff flanks
-    let under = ss(-.01, -.05, h);
-    alb = mix(mix(vec3f(.3, .3, .31), vec3f(.84, .82, .76), under), vec3f(.7, .58, .42), under * ss(-.11, -.06, h) * ss(.12, .02, p.z));
-    let head = ss(.2, .23, p.z);
-    alb = mix(alb, vec3f(.9, .9, .87), head);
-    alb = mix(alb, vec3f(.03), head * max(ss(.125, .145, h), ss(.085, .065, h) * ss(.27, .3, p.z)));
-    panel = vec3f(.2, .2, .22); wingC = panel; tailC = vec3f(.17, .17, .19); edgeC = tailC; bill = vec3f(.04); leg = vec3f(.2, .23, .28);
-  } else if (sp == 2) {
-    // A varied thrush: slate back, orange below and on the throat, a black band across the breast, an orange brow
-    // over a dark mask, two orange bars on the wing
-    let orange = vec3f(.8, .38, .07); let head = ss(.21, .24, p.z);
-    alb = mix(vec3f(.17, .2, .25), orange, ss(0., -.04, h));
-    alb = mix(alb, vec3f(.03, .03, .04), ss(.11, .13, p.z) * ss(.21, .19, p.z) * ss(.07, .04, h));
-    alb = mix(alb, orange, head * ss(.085, .065, h));
-    alb = mix(alb, vec3f(.06, .07, .09), head * ss(.085, .1, h) * ss(.16, .145, h));
-    alb = mix(alb, orange, head * ss(.15, .16, h) * ss(.2, .185, h) * ss(.38, .36, p.z));
-    panel = mix(vec3f(.1, .11, .13), orange, max(ss(.014, .006, abs(p.z + .03)), ss(.014, .006, abs(p.z - .045))));
-    wingC = vec3f(.12, .13, .16); tailC = vec3f(.13, .15, .19); edgeC = tailC; bill = vec3f(.1, .08, .07); leg = vec3f(.5, .38, .28);
-  } else {
-    // A Steller's jay: black head, crest and shoulders shading into deep blue, paler blue below; brighter blue
-    // wings and tail, barred across with black
-    let bar = .5 + .5 * step(.4, fract(p.z * 24.));
-    alb = mix(vec3f(.05, .15, .58) * (1. + .5 * ss(0., -.1, h)), vec3f(.025, .025, .035), ss(.15, .27, p.z + h * .15));
-    panel = vec3f(.07, .28, .9) * bar; wingC = vec3f(.07, .26, .85) * bar; tailC = vec3f(.07, .27, .88) * bar; edgeC = tailC;
-    bill = vec3f(.03); leg = vec3f(.04); panelZ = vec2f(-.12, .16); billZ = .4;
-  }
-  alb = mix(alb, panel, ss(.075, .1, abs(p.x)) * ss(-.06, -.01, h) * ss(panelZ.y, panelZ.y - .06, p.z) * ss(panelZ.x - .02, panelZ.x + .02, p.z));
-  alb = mix(alb, bill, ss(billZ, billZ + .015, p.z));
-  // (shut, a tail is all its middle's colour; as it fans, in flight or in a flick, its outer feathers show)
-  if (i.aux > .04 && i.aux < .15) { let edge = mix(.14, .09, ss(0., .5, i.fan)); alb = mix(tailC, edgeC, ss(edge, edge + .012, i.aux)); }
-  if (i.aux < -.04) { alb = mix(leg, vec3f(.01), step(i.aux, -.095)); }
-  if (wing > .5) { alb = wingC * mix(1., .7, ss(.3, .9, abs(i.aux))); }
-  alb *= .9 + .2 * own;
-  let E = sunE() * i.lt;
-  let c = alb * (E * (.2 + .8 * sat(dot(n, g.sun.xyz))) + amb(n, vol(i.wp).g) * 1.3);
-  return fin(fog(c, i.wp));
-}
-// The crow family's birds, the jay and the raven (birds.js meshCorvid): the instance as a bird's, with d = how far
-// the crest is raised, how far the toes are closed, the body's pitch (the feet and shanks do not take it) and the
-// head's own pitch. Each part moves in its own way, told by the vertex's aux (a whole number of 127ths); a
-// feather's place across and along its vane rides in its normal
+// The crow family's birds, the jay and the raven (birds.js meshCorvid). An instance (birds.js write): a = where its
+// feet are and its length, q = its turn, c = its species with its own seed in the fraction; the wings' phase; how
+// far they are spread (2 more in the air); the head's turn (-1 to 1, packed into the fraction) with the tail's fan
+// (fifteenths) in the whole part; d = how far the crest is raised, how far the toes are closed, the body's pitch
+// (the feet and shanks do not take it) and the head's own pitch. Each part moves in its own way, told by the
+// vertex's aux (a whole number of 127ths); a feather's place across and along its vane rides in its normal
 const JAX = .2; // a jay's axis over its feet, in lengths (birds.js meshCorvid)
 const RAX = .30; // a raven's: its heavy body carried higher on longer legs (birds.js RAVEN.lift)
 // Where a build's parts lie (birds.js JAY and RAVEN, kept the same): its axis over the feet, the shoulder (x, z of
@@ -1475,7 +1681,7 @@ struct JI { @location(0) p: vec3f, @location(1) n: vec4f, @location(2) a: vec4f,
 struct JV { @builtin(position) cp: vec4f, @location(0) wp: vec3f, @location(1) n: vec3f, @location(2) op: vec3f, @location(3) @interpolate(flat) part: f32, @location(4) lt: f32, @location(5) fe: vec2f, @location(6) @interpolate(flat) open: f32, @location(7) @interpolate(flat) kind: f32 };
 @vertex fn vsJay(i: JI) -> JV {
   var o: JV; var l = i.p; var n = i.n.xyz; let code = round(i.n.w * 127.);
-  let raven = i.c.x >= 4.; let F = formOf(raven); // (birds.js SPECIES: the jay 3, the raven 4, each with its seed; a stick 3)
+  let raven = i.c.x >= 1.; let F = formOf(raven); // (birds.js SPECIES: the jay 0, the raven 1, each with its seed; a stick 0)
   let air = step(1.5, i.c.z); let spread = i.c.z - 2. * air; let ph = i.c.y;
   let fan = floor(i.c.w) / 15.; let turn = (fract(i.c.w) - .5) / .45; let pitch = i.d.z;
   // (d holds two to a number: birds.js write)
@@ -1664,15 +1870,6 @@ fn ravenC(p: vec3f, fe: vec2f, wp: vec3f, lt: f32, ff: bool, part: i32, n0: vec3
   c += dot(amb(up, sky), vec3f(.3, .5, .2)) * vec3f(.06) * pow(1. - nv, 3.) * sat(n.y + .3);
   return fin(fog(c, wp));
 }
-@fragment fn fsManta(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
-  let n = normalize(i.n) * select(-1., 1., ff); let L = g.sun.xyz;
-  // dark above and browner below, black wing tips, and a white head and tail on those with a high seed (eagles)
-  var alb = mix(vec3f(.16, .12, .09), vec3f(.05, .045, .04), ss(-.2, .25, n.y));
-  alb = mix(alb, vec3f(.02), ss(.7, .95, abs(i.op.x)));
-  alb = mix(alb, vec3f(.78, .75, .68), max(ss(.26, .32, i.op.z), ss(-.34, -.42, i.op.z)) * step(.5, i.sd) * step(abs(i.op.x), .12));
-  let c = alb * (sunE() * (.3 + .7 * sat(dot(n, L))) + amb(n, 1.) * 1.4);
-  return fin(fog(c, i.wp));
-}
 `;
 
 // ---------------------------------------------------------------- the lake's surface, and the sky behind everything
@@ -1691,8 +1888,8 @@ struct VO { @builtin(position) cp: vec4f, @location(0) wp: vec3f };
 // the ray it stops (the bank and its trees, crowns hanging over the water), y how far off that is, in metres
 fn mirror(p: vec3f, R: vec3f) -> vec2f {
   var clear = 1.; var far = 0.;
-  for (var k = 0; k < ${MEDIUM ? 6 : 4}; k++) {
-    let t = 2.2 * exp2(f32(k) * ${MEDIUM ? '.8' : '1.25'});
+  for (var k = 0; k < ${HIGH ? 6 : 4}; k++) {
+    let t = 2.2 * exp2(f32(k) * ${HIGH ? '.8' : '1.25'});
     let v = vol(p + R * t);
     let b = max(ss(.75, .3, v.g), ss(.52, .46, v.r)) * clear;
     far += b * t; clear -= b;
@@ -2132,7 +2329,8 @@ export const W_RAYS =
   let mu = max(dot(rd, sx), 0.);
   let ph = .03 + 2.6 * pow(mu, 4.) + .3 * pow(mu, 2.);
   let clear = (1. - g.sun.w) * (1. - g.sun.w);
-  return vec4f(min(SUNC * (acc * dt * .016 * ph * g.mis.y * clear), vec3f(20.)), zl);
+  // (the depth kept is at most a half float's largest: the sky's, 1e5 m, is stored as infinity on an Apple GPU)
+  return vec4f(min(SUNC * (acc * dt * .016 * ph * g.mis.y * clear), vec3f(20.)), min(zl, 65504.));
 }
 `;
 // depth-aware 3x3 blur of the half-res shafts (hides the sampling dither)
@@ -2142,14 +2340,15 @@ export const W_RBLUR =
 @group(0) @binding(0) var tR: texture_2d<f32>;
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   let p = vec2i(fc.xy); let mx = vec2i(textureDimensions(tR)) - 1;
-  let c = textureLoad(tR, p, 0);
+  // (depths held finite and positive, whatever was stored: an infinity here made a NaN, a black block)
+  let c = textureLoad(tR, p, 0); let ca = clamp(c.a, .01, 65504.);
   var acc = vec3f(0.); var ws = 0.;
   for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
     let r = textureLoad(tR, clamp(p + vec2i(x, y) , vec2i(0), mx), 0);
-    let w = 1. / (.03 + abs(r.a - c.a) / c.a);
+    let w = 1. / (.03 + abs(clamp(r.a, .01, 65504.) - ca) / ca);
     acc += r.rgb * w; ws += w;
   } }
-  return vec4f(acc / ws, c.a);
+  return vec4f(acc / ws, ca);
 }
 `;
 
@@ -2218,7 +2417,7 @@ fn tmap(x: vec3f) -> vec3f { return sat3((x * (2.51 * x + .03)) / (x * (2.43 * x
     let o = vec2i(k & 1, k >> 1);
     let r = textureLoad(tR, clamp(bi + o, vec2i(0), mx), 0);
     let bw = mix(1. - f.x, f.x, f32(o.x)) * mix(1. - f.y, f.y, f32(o.y));
-    let w = (bw + .02) / (.02 + abs(r.a - zf) / zf);
+    let w = (bw + .02) / (.02 + abs(clamp(r.a, .01, 65504.) - zf) / zf); // (never 0: ws stays above 0)
     acc += r.rgb * w; ws += w;
   }
   var c = textureLoad(tS, px, 0).rgb + acc / ws;

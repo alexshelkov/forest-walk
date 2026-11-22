@@ -24,18 +24,27 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
+// The renderer: boot() builds the world (world.js, water.js), bakes what the GPU draws from, and runs the frame loop
+// that main.ts pauses and resumes. Tier switches come from quality.js (lv below, HIGH, LOW); the debug API at the end
+// is what the testing menu, the budget view and test scripts call: keep its names.
 import {
   AA,
   ATLAS,
   ATLAS_MIPS,
   demote,
   keep,
-  MEDIUM,
+  HIGH,
+  LOW,
   mob,
   NEAR_D,
   RAYD,
+  LAST_FAILED,
+  PROMOTABLE,
+  promote,
   SHADOW,
   SIZE,
+  STEP,
+  TIER as TIER_NAME,
   SLOW,
   SPRIGS,
   WATER,
@@ -80,12 +89,15 @@ import {
   W_DENS,
   W_DETAIL,
   W_LEAF,
+  W_LEAF_LIGHT,
+  W_LEAF_LOW,
   W_LEVEL,
   W_METER,
   W_POST,
   W_RAYS,
   W_RBLUR,
   W_SOLID,
+  W_SOLID_LOW,
   W_SIGN,
   W_SPR,
   W_STREAM,
@@ -99,9 +111,7 @@ import {
   makeWorld,
   MESAS,
   trailField,
-  meshBird,
   meshChunk,
-  meshFlyer,
   meshLog,
   meshShroom,
   LABELS,
@@ -126,7 +136,6 @@ import {
   soundResume,
 } from './audio.js';
 import { bakeSounds, SURFACES } from './sounds.js';
-import { makeCreatures } from './creatures.js';
 import { makeDeer } from './deer.js';
 import {
   FIRST_JAY_AT,
@@ -137,14 +146,11 @@ import {
   meshJayNear,
   meshPerchStick,
   meshRaven,
-  meshSongbird,
   RAVEN_REACH,
 } from './birds.js';
 
-// Switched off while the forest itself is being worked on. ANIMALS: the deer, fox, squirrels, owls and ducks of
-// creatures.js, the flocks and soaring birds, the fireflies. SOUND: the soundscape of audio.js
-const ANIMALS = false,
-  SOUND = true;
+// SOUND: the soundscape of audio.js (false silences it, for work on the picture alone)
+const SOUND = true;
 // The weather. A state is what it brings, each 0 to 1: rain falling, the fog thickening, a storm overhead. The
 // walk opens in clear (the mist and low sun of FOG and MIST below) and drifts through DRIFT, a state for so many
 // seconds, round and round. Each value eases toward its state's by its own clock (step): the weather never
@@ -184,17 +190,24 @@ const MIST = 0.38;
 // renderer, camera and frame loop; boot() builds the world once, the tik drives it (src/main.ts)
 // ============================================================================
 export async function boot({ canvas, input, facts, say, problem, dev }) {
-  // raf: the frame loop's pending request, 0 while paused; dead: a problem ended the scene; frames: drawn so far
+  // raf: the frame loop's pending request, 0 while paused; dead: a problem ended the scene; frames: drawn so far;
+  // loading: until the load has run 15 s of frames; gpuFailed: the GPU failed while loading (markLoad)
   let raf = 0,
     dead = false,
-    frames = 0;
-  // Every problem ends the scene and goes on screen. `retry` ones (out of memory, a GPU timeout) on Medium reload
-  // at Low first, and this device keeps to Low (quality.js)
+    frames = 0,
+    loading = true,
+    gpuFailed = false;
+  // Every problem ends the scene and goes on screen. `retry` ones (out of memory, a GPU timeout) on High reload at
+  // Medium, and this device keeps to Medium (quality.js); lower, in the load, the next start goes a step down
   const stop = (m, retry, error) => {
-    if (retry && MEDIUM) {
+    if (retry && HIGH) {
       demote('gpu');
       location.reload();
       return;
+    }
+    if (retry && loading) {
+      gpuFailed = true;
+      keep('forestTierLoad', LEVEL);
     }
     dead = true;
     pause();
@@ -204,7 +217,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const fail = (m) => {
     throw new Error(m, { cause: 1 });
   }; // cause marks a message that is shown as it is
-  const LEVEL = MEDIUM ? 'Medium' : 'Low';
+  const LEVEL = TIER_NAME;
   facts.detail = `${LEVEL} (${WHY})`;
   if (!navigator.gpu)
     fail(
@@ -213,7 +226,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const adapter = await navigator.gpu.requestAdapter({
     powerPreference: 'high-performance',
   });
-  if (!adapter) fail('This phone has no WebGPU graphics adapter.');
+  // (straight after a start that lost the device, a phone may give no adapter until the app is opened afresh; the
+  // next start still counts as one after a failed one, and takes no step: quality.js guard)
+  if (!adapter && LAST_FAILED) keep('forestTierLoad', 'no adapter');
+  if (!adapter)
+    fail(
+      LAST_FAILED
+        ? 'The graphics chip is recovering from a failed start. Close the app and open it again.'
+        : 'This phone has no WebGPU graphics adapter.',
+    );
   {
     const i = adapter.info || {};
     facts.gpu =
@@ -227,9 +248,48 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const device = await adapter.requestDevice({
     requiredFeatures: hasTS ? ['timestamp-query'] : [],
   });
+  // What the GPU was asked to hold, in bytes: every buffer and texture made here, less those let go (an estimate:
+  // a texture's texels by its format, its levels and its samples); in facts.memory and the budget view
+  const gpuMem = { buffers: 0, textures: 0 };
+  {
+    const TEXEL = { rgba16float: 8, r8unorm: 1, rg8unorm: 2 }, // (else 4 bytes)
+      makeBuffer = device.createBuffer.bind(device),
+      makeTexture = device.createTexture.bind(device),
+      held = (kind, object, bytes) => {
+        gpuMem[kind] += bytes;
+        const letGo = object.destroy.bind(object);
+        object.destroy = () => {
+          gpuMem[kind] -= bytes;
+          letGo();
+          memoryFacts();
+        };
+        memoryFacts();
+        return object;
+      };
+    device.createBuffer = (d) => held('buffers', makeBuffer(d), d.size);
+    device.createTexture = (d) => {
+      const [w, h = 1, layers = 1] = Array.isArray(d.size)
+          ? d.size
+          : [d.size.width, d.size.height, d.size.depthOrArrayLayers],
+        texel = TEXEL[d.format] || 4;
+      let bytes = 0;
+      for (let level = 0; level < (d.mipLevelCount || 1); level++)
+        bytes +=
+          max(w >> level, 1) *
+          max(h >> level, 1) *
+          (d.dimension === '3d' ? max(layers >> level, 1) : layers) *
+          texel;
+      return held('textures', makeTexture(d), bytes * (d.sampleCount || 1));
+    };
+  }
+  function memoryFacts() {
+    const heap = performance.memory?.usedJSHeapSize;
+    facts.memory = `gpu buffers ${(gpuMem.buffers / 1048576).toFixed(0)} MB, textures ${(gpuMem.textures / 1048576).toFixed(0)} MB; js heap ${heap ? (heap / 1048576).toFixed(0) + ' MB' : 'n/a'}`;
+  }
   // any GPU error invalidates the frames it touches (a black screen), so it is never left in the console alone
   device.addEventListener('uncapturederror', (e) => {
     console.error('GPU: ' + e.error.message);
+    memoryFacts();
     const kind = e.error.constructor.name; // by name: not every browser has every GPU error class
     stop(
       `${kind}: ${e.error.message.slice(0, 300)}`,
@@ -238,6 +298,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   });
   device.lost.then((l) => {
     if (l.reason === 'destroyed') return; // the page is closing
+    memoryFacts();
     stop(
       `The graphics device was lost (${l.reason || 'no reason given'}). ${(l.message || '').slice(0, 200)}`,
       true,
@@ -246,7 +307,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const ctx = canvas.getContext('webgpu'),
     FMT = navigator.gpu.getPreferredCanvasFormat();
   const Q = device.queue,
-    HDR = 'rgba16float',
+    HDR = 'rgba16float', // (half floats: whatever is written to it stays under 65504, shaders.js fin)
     DEPTH = 'depth32float';
   const TU = GPUTextureUsage,
     BU = GPUBufferUsage,
@@ -262,23 +323,36 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     });
     return m;
   };
-  // Each pipeline in its own error scope, so a failure names it: a driver's message ("Vertex library failed
-  // creation" from Safari) names no shader. The label: module.vertex/fragment entry points, then constants.
+  // Every pipeline is compiled ahead (the Async calls, awaited in groups during the load), so none is left to
+  // compile on its first use in a frame: on a phone that lands on the GPU with the first frame and can lose it.
+  // A failure names its pipeline: a driver's message ("Vertex library failed creation" from Safari) names no
+  // shader. The label: module.vertex/fragment entry points, then constants. pipes: how many, and the ms the load
+  // waited on them (compiled: awaits the given ones and counts the wait)
+  const pipes = { n: 0, ms: 0 };
   const scoped = (compute, desc) => {
     const v = compute ? desc.compute : desc.vertex,
       c = v.constants ? ' ' + JSON.stringify(v.constants) : '';
     const label = `${v.module.label}.${v.entryPoint}${desc.fragment ? '/' + desc.fragment.entryPoint : ''}${c}`;
-    device.pushErrorScope('validation');
-    const p = compute
-      ? device.createComputePipeline({ ...desc, label })
-      : device.createRenderPipeline({ ...desc, label });
-    device.popErrorScope().then((e) => {
-      if (e) stop(`Pipeline ${label}: ${e.message.slice(0, 300)}`);
+    pipes.n++;
+    return (
+      compute
+        ? device.createComputePipelineAsync({ ...desc, label })
+        : device.createRenderPipelineAsync({ ...desc, label })
+    ).catch((e) => {
+      const m = `Pipeline ${label}: ${String(e.message).slice(0, 300)}`;
+      stop(m);
+      fail(m); // (the same message: shown once)
     });
-    return p;
   };
   const rpipe = (desc) => scoped(false, desc),
     cpipe = (desc) => scoped(true, desc);
+  const compiled = async (list) => {
+    const t0 = performance.now(),
+      done = await Promise.all(list);
+    pipes.ms += performance.now() - t0;
+    facts.pipelines = `${pipes.n}, ${pipes.ms.toFixed(0)} ms waited`;
+    return done;
+  };
   const buf = (data, usage) => {
     const b = device.createBuffer({
       size: max((data.byteLength + 3) & ~3, 4),
@@ -310,7 +384,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     magFilter: 'linear',
     minFilter: 'linear',
     mipmapFilter: 'linear',
-    maxAnisotropy: MEDIUM ? 8 : 4,
+    maxAnisotropy: HIGH ? 8 : 4,
   });
   const sClamp = device.createSampler({
     magFilter: 'linear',
@@ -366,13 +440,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
 
   // the scene's uniforms (struct G in shaders.js): two matrices and seventeen vec4, for the view and for the shadow
   // pass
-  const UB = new Float32Array(100),
-    UBS = new Float32Array(100);
+  const UB = new Float32Array(104),
+    UBS = new Float32Array(104);
   const ubo = device.createBuffer({
-      size: 400,
+      size: 416,
       usage: BU.UNIFORM | BU.COPY_DST,
     }),
-    uboS = device.createBuffer({ size: 400, usage: BU.UNIFORM | BU.COPY_DST });
+    uboS = device.createBuffer({ size: 416, usage: BU.UNIFORM | BU.COPY_DST });
   const WT = new Float32Array(4),
     uboW = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST });
 
@@ -447,11 +521,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         ],
       },
     });
-  const pMip8 = blitPipe('fsMip', 'rgba8unorm'),
-    pMip16 = blitPipe('fsMip', HDR),
-    pDown0 = blitPipe('fsDown0', HDR),
-    pDown = blitPipe('fsDown', HDR),
-    pUp = blitPipe('fsUp', HDR, true);
+  const [pMip8, pMip16, pDown0, pDown, pUp] = await compiled([
+    blitPipe('fsMip', 'rgba8unorm'),
+    blitPipe('fsMip', HDR),
+    blitPipe('fsDown0', HDR),
+    blitPipe('fsDown', HDR),
+    blitPipe('fsUp', HDR, true),
+  ]);
   const blitBG = (view) =>
     device.createBindGroup({
       layout: bglBlit,
@@ -494,16 +570,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       A(1, 16, 'float32x4'),
       A(2, 32, 'unorm8x4'),
     ],
-  };
-  const ibAnim = {
-    arrayStride: 32,
-    stepMode: 'instance',
-    attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4')],
-  };
-  const ibBub = {
-    arrayStride: 32,
-    stepMode: 'instance',
-    attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4')],
   };
   const ibSnow = {
     arrayStride: 16,
@@ -569,38 +635,63 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     mAnim = mod(W_ANIM, 'ANIM'),
     mSurf = mod(W_SURF, 'SURF'),
     mSpr = mod(W_SPR, 'SPR');
-  const pTerrain = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], {
-    cull: 'back',
-  });
-  const pSolid = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid]),
-    pShell = scenePipe(mSolid, 'vsShell', 'fs', [vbSolid, ibSolid]);
+  // (Low: the ground from its bake, W_SOLID_LOW, with the bake's textures as group 1; the solids lit per vertex; no
+  // bark shell)
+  const mLow = LOW ? mod(W_SOLID_LOW, 'SOLID_LOW') : null,
+    bglGround = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: SS.FRAGMENT, texture: {} },
+        { binding: 1, visibility: SS.FRAGMENT, texture: {} },
+        { binding: 2, visibility: SS.FRAGMENT, sampler: {} },
+        { binding: 3, visibility: SS.FRAGMENT, texture: {} },
+      ],
+    });
+  const pTerrainAsk = LOW
+    ? scenePipe(mLow, 'vsG', 'fsG', [vbSolid, ibSolid], {
+        cull: 'back',
+        layout: device.createPipelineLayout({
+          bindGroupLayouts: [bgl0, bglGround],
+        }),
+      })
+    : scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], { cull: 'back' });
+  const pSolidAsk = LOW
+      ? scenePipe(mLow, 'vsO', 'fsO', [vbSolid, ibSolid])
+      : scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid]),
+    pShellAsk = LOW
+      ? null
+      : scenePipe(mSolid, 'vsShell', 'fs', [vbSolid, ibSolid]);
   // Leaf pipelines. Each store thins with distance (W_LEAF thin: the share kept goes from K0 to KMIN): the trees'
   // and the shrubs' cards by distances that follow the fog (STORE 1 and 2, lodNow), the ground's plants by their
   // own (PD1, PD2) and ending at PLANT_END
-  const PLANT_END = MEDIUM ? 46 : 38;
+  const PLANT_END = HIGH ? 46 : 38;
   const THIN_TREE = { STORE: 1, K0: 1.25, KMIN: 0.25 },
     THIN_SHRUB = { STORE: 2, K0: 1.25, KMIN: 0.25 },
     THIN_SMALL = { FAR: PLANT_END, PD1: 6, PD2: 28, K0: 1, KMIN: 0.15 };
-  // the strips of the ground's plants and of the bare limbs; the quads of a tree's and of a shrub's cards
-  const pLeafS = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], {
+  // the strips of the ground's plants and of the bare limbs; the quads of a tree's and of a shrub's cards. (Low:
+  // W_LEAF_LOW, each card's light record a second vertex buffer, lightOf)
+  const mLeafLow = LOW ? mod(W_LEAF_LOW, 'LEAF_LOW') : null,
+    ibLight = {
+      arrayStride: 4,
+      stepMode: 'instance',
+      attributes: [A(3, 0, 'unorm8x4')],
+    },
+    leafPipe = (vsE, vsLow, o) =>
+      LOW
+        ? scenePipe(mLeafLow, vsLow, 'fsL', [ibLeaf, ibLight], o)
+        : scenePipe(mLeaf, vsE, 'fs', [ibLeaf], o);
+  const pLeafSAsk = leafPipe('vs', 'vsL', {
       strip: true,
       constants: { ROWS: 3, ...THIN_SMALL },
     }),
-    pLeafL = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], {
+    pLeafLAsk = leafPipe('vs', 'vsL', {
       strip: true,
       constants: { ROWS: 3, ...THIN_TREE },
     });
-  const pLeafM = scenePipe(mLeaf, 'vsN', 'fs', [ibLeaf], {
-      constants: THIN_TREE,
-    }),
-    pLeafMS = scenePipe(mLeaf, 'vsN', 'fs', [ibLeaf], {
-      constants: THIN_SHRUB,
-    });
+  const pLeafMAsk = leafPipe('vsN', 'vsNL', { constants: THIN_TREE }),
+    pLeafMSAsk = leafPipe('vsN', 'vsNL', { constants: THIN_SHRUB });
   // a far tree's crown as one picture (W_LEAF vsFar)
-  const pFish = scenePipe(mAnim, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
-  const pManta = scenePipe(mAnim, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
   // (the boat's lid: a solid drawn into the depth only, so the lake's surface stays out of the hull)
-  const pLid = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], {
+  const pLidAsk = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], {
     noColor: true,
   });
   // the birds of birds.js: an instance each, posed in the vertex shader
@@ -614,15 +705,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       A(5, 48, 'float32x4'),
     ],
   };
-  const pBird = scenePipe(mAnim, 'vsBird', 'fsBird', [vbSolid, ibBird16]),
-    // (the jay from close by: its own entry points, for its many parts)
-    pJay = scenePipe(mAnim, 'vsJay', 'fsJay', [vbSolid, ibBird16]);
+  // (the jay and the raven: vsJay tells them apart)
+  const pJayAsk = scenePipe(mAnim, 'vsJay', 'fsJay', [vbSolid, ibBird16]);
   const ALPHA = {
     color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
     alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
   };
   // a far tree's picture blended in (W_LEAF vsFar, fsFar) over the opaque scene, writing no depth (farSorted)
-  const pLeafFB = scenePipe(mLeaf, 'vsFar', 'fsFar', [ibLeaf], {
+  const pLeafFBAsk = scenePipe(mLeaf, 'vsFar', 'fsFar', [ibLeaf], {
     strip: true,
     blend: ALPHA,
   });
@@ -631,37 +721,46 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     alpha: { srcFactor: 'one', dstFactor: 'one' },
   };
   // the dark blot under an animal on the ground: what is there already, darkened
-  const pBlot = scenePipe(mod(W_BLOT, 'BLOT'), 'vs', 'fs', [ibBolt], {
+  const pBlotAsk = scenePipe(mod(W_BLOT, 'BLOT'), 'vs', 'fs', [ibBolt], {
     strip: true,
     blend: {
       color: { srcFactor: 'zero', dstFactor: 'src' },
       alpha: { srcFactor: 'zero', dstFactor: 'one' },
     },
   });
-  const pSurf = scenePipe(mSurf, 'vs', 'fs', [], { strip: true, blend: ALPHA }),
-    pBack = scenePipe(mSurf, 'vsB', 'fsB', [], { strip: true });
-  const pStream = scenePipe(mod(W_STREAM, 'STREAM'), 'vs', 'fs', [vbStream], {
-    blend: ALPHA,
-  });
-  const pSnow = scenePipe(mSpr, 'vsSnow', 'fsSnow', [ibSnow], {
+  const pSurfAsk = scenePipe(mSurf, 'vs', 'fs', [], {
+      strip: true,
+      blend: ALPHA,
+    }),
+    pBackAsk = scenePipe(mSurf, 'vsB', 'fsB', [], { strip: true });
+  const pStreamAsk = scenePipe(
+    mod(W_STREAM, 'STREAM'),
+    'vs',
+    'fs',
+    [vbStream],
+    {
+      blend: ALPHA,
+    },
+  );
+  const pSnowAsk = scenePipe(mSpr, 'vsSnow', 'fsSnow', [ibSnow], {
       strip: true,
       blend: ADD,
     }),
-    pRain = scenePipe(mSpr, 'vsRain', 'fsRain', [ibSnow], {
+    pRainAsk = scenePipe(mSpr, 'vsRain', 'fsRain', [ibSnow], {
       strip: true,
       blend: ALPHA,
     });
   // the rain's drips under the crowns, and its two sheets of streaks further off (W_SPR)
-  const pDrip = scenePipe(mSpr, 'vsDrip', 'fsRain', [ibSnow], {
+  const pDripAsk = scenePipe(mSpr, 'vsDrip', 'fsRain', [ibSnow], {
       strip: true,
       blend: ALPHA,
     }),
-    pVeil = scenePipe(mSpr, 'vsVeil', 'fsVeil', [], {
+    pVeilAsk = scenePipe(mSpr, 'vsVeil', 'fsVeil', [], {
       strip: true,
       blend: ALPHA,
     });
   // a bolt of lightning: a quad to each segment of its channels (W_SPR vsBolt), its light added to the sky's
-  const pBolt = scenePipe(mSpr, 'vsBolt', 'fsBolt', [ibBolt], {
+  const pBoltAsk = scenePipe(mSpr, 'vsBolt', 'fsBolt', [ibBolt], {
     strip: true,
     blend: ADD,
   });
@@ -691,7 +790,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       [wide, row * 8],
     );
   }
-  const pSign = scenePipe(mod(W_SIGN, 'SIGN'), 'vs', 'fs', [ibBolt], {
+  const pSignAsk = scenePipe(mod(W_SIGN, 'SIGN'), 'vs', 'fs', [ibBolt], {
     strip: true,
     blend: ALPHA,
     layout: device.createPipelineLayout({ bindGroupLayouts: [bgl0, bglBlit] }),
@@ -703,25 +802,87 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       { binding: 1, resource: sRep },
     ],
   });
-  const pFall = scenePipe(mSpr, 'vsFall', 'fsFall', [ibSnow], { strip: true });
-  // no constants: vsGl reads none, and Safari fails to build a vertex shader given an override it does not use
-  const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], {
+  const pFallAsk = scenePipe(mSpr, 'vsFall', 'fsFall', [ibSnow], {
     strip: true,
-    blend: ADD,
   });
-  const pSolidSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid]),
-    pTerrSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid], { cull: 'front' });
-  const pLeafSh = shadowPipe(mLeaf, 'vs', [ibLeaf], {
+  const pSolidShAsk = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid]),
+    pTerrShAsk = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid], {
+      cull: 'front',
+    });
+  const pLeafShAsk = shadowPipe(mLeaf, 'vs', [ibLeaf], {
     strip: true,
     constants: { ROWS: 3 },
   });
+  // the scene's pipelines, all compiled before the first frame (scoped above): a new one joins this list
+  const [
+    pTerrain,
+    pSolid,
+    pShell,
+    pLeafS,
+    pLeafL,
+    pLeafM,
+    pLeafMS,
+    pLid,
+    pJay,
+    pLeafFB,
+    pBlot,
+    pSurf,
+    pBack,
+    pStream,
+    pSnow,
+    pRain,
+    pDrip,
+    pVeil,
+    pBolt,
+    pSign,
+    pFall,
+    pSolidSh,
+    pTerrSh,
+    pLeafSh,
+  ] = await compiled([
+    pTerrainAsk,
+    pSolidAsk,
+    pShellAsk,
+    pLeafSAsk,
+    pLeafLAsk,
+    pLeafMAsk,
+    pLeafMSAsk,
+    pLidAsk,
+    pJayAsk,
+    pLeafFBAsk,
+    pBlotAsk,
+    pSurfAsk,
+    pBackAsk,
+    pStreamAsk,
+    pSnowAsk,
+    pRainAsk,
+    pDripAsk,
+    pVeilAsk,
+    pBoltAsk,
+    pSignAsk,
+    pFallAsk,
+    pSolidShAsk,
+    pTerrShAsk,
+    pLeafShAsk,
+  ]);
 
   const mWater = mod(W_WATER, 'WATER');
-  const pWater = rpipe({
-    layout: 'auto',
-    vertex: { module: mWater, entryPoint: 'vs' },
-    fragment: { module: mWater, entryPoint: 'fs', targets: [{ format: HDR }] },
-  });
+  const mRays = mod(W_RAYS, 'RAYS'),
+    mPost = mod(W_POST, 'POST'),
+    mRB = mod(W_RBLUR, 'RBLUR');
+  // the full-screen passes' pipelines: the water's texture, the light shafts and their blur, the post
+  const fullScreen = (m, format) =>
+    rpipe({
+      layout: 'auto',
+      vertex: { module: m, entryPoint: 'vs' },
+      fragment: { module: m, entryPoint: 'fs', targets: [{ format }] },
+    });
+  const [pWater, pRB, pRays, pPost] = await compiled([
+    fullScreen(mWater, HDR),
+    fullScreen(mRB, HDR),
+    fullScreen(mRays, HDR),
+    fullScreen(mPost, FMT),
+  ]);
   const bgWater = device.createBindGroup({
     layout: pWater.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: uboW } }],
@@ -734,24 +895,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     colorAttachments: [colorAtt(v, true)],
   }));
 
-  const mRays = mod(W_RAYS, 'RAYS'),
-    mPost = mod(W_POST, 'POST'),
-    mRB = mod(W_RBLUR, 'RBLUR');
-  const pRB = rpipe({
-    layout: 'auto',
-    vertex: { module: mRB, entryPoint: 'vs' },
-    fragment: { module: mRB, entryPoint: 'fs', targets: [{ format: HDR }] },
-  });
-  const pRays = rpipe({
-    layout: 'auto',
-    vertex: { module: mRays, entryPoint: 'vs' },
-    fragment: { module: mRays, entryPoint: 'fs', targets: [{ format: HDR }] },
-  });
-  const pPost = rpipe({
-    layout: 'auto',
-    vertex: { module: mPost, entryPoint: 'vs' },
-    fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] },
-  });
   // The eye's measure of the frame (W_METER): a 16 x 16 grid of luminance to the 4th power, and the highlights
   // adapted to, in two targets that take turns, one written each frame from the other (meterAt: the one written
   // last)
@@ -767,8 +910,10 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           targets: [{ format: METER }],
         },
       });
-  const pGrid = meterPipe('fsGrid'),
-    pAdapt = meterPipe('fsAdapt');
+  const [pGrid, pAdapt] = await compiled([
+    meterPipe('fsGrid'),
+    meterPipe('fsAdapt'),
+  ]);
   const tGrid = tex(16, 16, METER, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING),
     tAdapt = [0, 1].map(() =>
       tex(1, 1, METER, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.COPY_SRC),
@@ -838,23 +983,24 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     for (let i = 0; i < 3; i++) {
       UB[48 + i] = UBS[48 + i] = SUN[i];
     }
-    // the shadow pass: res.x 0 marks it for the shaders, no wind, full draw distance
-    UBS[58] = 1;
+    // the shadow pass: res.x 0 marks it for the shaders, no wind
+    UBS.set([1, 1, HIGH ? 9 : 4, 1], 100); // (kn: the Try knobs as today: the shadow is baked with the trees swayed)
     Q.writeBuffer(uboS, 0, UBS);
   }
 
   // ---------------------------------------------------------------- world generation
   await say('Raising the hills…', 0.25, 1200);
   // Marks a load in progress at this level (quality.js) while the page is in view: leaving it, or hiding it (a
-  // phone may kill an app sent to the background), before the load ends is not a crash
-  let loading = true;
+  // phone may kill an app sent to the background), before the load ends is not a crash. A GPU failure stays marked
   const markLoad = () =>
     keep(
-      'forestLoad',
-      loading && document.visibilityState === 'visible' ? LEVEL : '',
+      'forestTierLoad',
+      gpuFailed || (loading && document.visibilityState === 'visible')
+        ? LEVEL
+        : '',
     );
   markLoad();
-  addEventListener('pagehide', () => keep('forestLoad', ''));
+  addEventListener('pagehide', () => gpuFailed || keep('forestTierLoad', ''));
   document.addEventListener('visibilitychange', markLoad);
   // The density field (84 MB) lives only inside this call: when it returns, the generator's working memory goes
   const { water, T, Wd } = await (async () => {
@@ -867,10 +1013,12 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         // First the ground's height where the streams are to run, before they cut into it: their levels are set by it
         const pts = probes(),
           n = pts.length / 2,
-          p = cpipe({
-            layout: 'auto',
-            compute: { module: mod(W_LEVEL, 'LEVEL'), entryPoint: 'main' },
-          });
+          [p] = await compiled([
+            cpipe({
+              layout: 'auto',
+              compute: { module: mod(W_LEVEL, 'LEVEL'), entryPoint: 'main' },
+            }),
+          ]);
         const bo = device.createBuffer({
             size: n * 4,
             usage: BU.STORAGE | BU.COPY_SRC,
@@ -902,10 +1050,12 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         bo.destroy();
       }
       const m = mod(W_DENS, 'DENS'),
-        p = cpipe({
-          layout: 'auto',
-          compute: { module: m, entryPoint: 'main' },
-        });
+        [p] = await compiled([
+          cpipe({
+            layout: 'auto',
+            compute: { module: m, entryPoint: 'main' },
+          }),
+        ]);
       // One dispatch of the whole field (21M samples, 84 MB) trips a phone GPU's hang timeout and drops WebView's
       // GPU connection, so it runs in slabs of SLAB z-slices, one submit and readback each. SLAB: a multiple of 4.
       const SLAB = 16,
@@ -1203,27 +1353,35 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const OCN = 128,
     OCW = (NX * VS) / OCN,
     occ = Wd.occ,
-    vis = new Uint8Array(CELLS * CELLS).fill(1);
+    vis = new Uint8Array(CELLS * CELLS).fill(1),
+    // (and for the limbs and trunks, filed by their roots, whose cards may lie in the next cell: vis or a neighbour's)
+    visNear = new Uint8Array(CELLS * CELLS).fill(1);
   const SIGHT = [0, 0, -9, -9, 9, -9, -9, 9, 9, 9]; // where in a cell the sight lines end: its middle and toward its corners
   let visX = 1e9,
     visZ = 1e9,
+    visR = 0,
     visN = 0;
   function sight() {
     const cx = F[CX],
       cz = F[CZ];
-    if ((cx - visX) * (cx - visX) + (cz - visZ) * (cz - visZ) < 6) return;
+    if (
+      (cx - visX) * (cx - visX) + (cz - visZ) * (cz - visZ) < 6 &&
+      abs(LOD.seen - visR) < 2
+    )
+      return;
     visX = cx;
     visZ = cz;
+    visR = LOD.seen;
     visN = 0;
     for (let c = 0; c < CELLS * CELLS; c++) {
       const tx = OX + ((c % CELLS) + 0.5) * CELLW,
         tz = OZ + (floor(c / CELLS) + 0.5) * CELLW;
-      // (a cell any of which is within 46 m is always drawn: nearer than that the fog leaves enough of a thing for
-      // a whole cell of them coming or going to show)
+      // (a cell any of which is nearer than LOD.seen, where the fog has closed, is always drawn: the sight lines are an
+      // estimate, and what the fog still shows must never appear or vanish at once)
       {
         const hx = max(abs(tx - cx) - CELLW / 2, 0),
           hz = max(abs(tz - cz) - CELLW / 2, 0);
-        if (hx * hx + hz * hz < 2116) {
+        if (hx * hx + hz * hz < visR * visR) {
           vis[c] = 1;
           visN++;
           continue;
@@ -1247,6 +1405,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       // hidden: under about 2% of it would show. A cell in view stays a little longer, so it does not flicker at the edge
       vis[c] = best < (vis[c] ? 4.6 : 3.8) ? 1 : 0;
       visN += vis[c];
+    }
+    for (let c = 0; c < CELLS * CELLS; c++) {
+      const cx0 = c % CELLS,
+        cz0 = floor(c / CELLS);
+      let any = 0;
+      for (let j = max(cz0 - 1, 0); j <= min(cz0 + 1, CELLS - 1); j++)
+        for (let i = max(cx0 - 1, 0); i <= min(cx0 + 1, CELLS - 1); i++)
+          any |= vis[i + CELLS * j];
+      visNear[c] = any;
     }
   }
   // Viewpoints for a debugger (debug.view): a point of the trail and how many points ahead to look. 0 is where the
@@ -1274,9 +1441,10 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   };
 
   await say('Building bridges…', 0.94, 1200);
-  // lv(low, medium): a value per level. Low is tuned for a phone, where the scene is bound by its triangle count:
-  // almost every distance below is where something swaps to a cheaper mesh or stops being drawn.
-  const lv = (low, medium) => (MEDIUM ? medium : low);
+  // lv(medium, high): a value per tier, Low taking Medium's. Medium is tuned for a phone, where the scene is bound by
+  // its triangle count: almost every distance below is where something swaps to a cheaper mesh or stops being drawn.
+  // A change to the picture is checked at Low first (quality.js), then Medium and High.
+  const lv = (medium, high) => (HIGH ? high : medium);
   const meshes = [],
     KINDS = Array.from({ length: NTRUNK }, (_, k) => k);
   // add(...): appends meshes (built or not) and returns the id of the first
@@ -1296,7 +1464,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   );
   const M_TRUNK = 4,
     M_WOOD = 4 + NTRUNK;
-  // (the middle boulders have the near ones' fine lumps: on Low they are the same mesh, so nothing swaps close by)
+  // (the middle boulders have the near ones' fine lumps: below High they are the same mesh, so nothing swaps close by)
   const M_BOULDER_MID = add(
       meshChunk(1, 1, 1),
       meshChunk(7, 1, 1),
@@ -1310,15 +1478,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       meshStump(2),
     );
   // loose pieces by kind (world.js chunk): near, the three large rocks' middle level, and one of 20 triangles for each
-  // (Low: the small rocks are 20 flat faces at every distance and the large rocks' near mesh is their middle one,
-  // 80 flat faces: nothing swaps close by)
+  // (below High: the small rocks are 20 flat faces at every distance and the large rocks' near mesh is their middle
+  // one, 80 flat faces: nothing swaps close by)
   const M_CHUNK = add(
-    meshChunk(3, MEDIUM ? 2 : 0),
-    meshChunk(11, MEDIUM ? 2 : 0),
+    meshChunk(3, HIGH ? 2 : 0),
+    meshChunk(11, HIGH ? 2 : 0),
     meshShroom(),
-    ...[5, 17, 41].map((sd) =>
-      MEDIUM ? meshChunk(sd, 3) : meshChunk(sd, 2, 1),
-    ),
+    ...[5, 17, 41].map((sd) => (HIGH ? meshChunk(sd, 3) : meshChunk(sd, 2, 1))),
     meshChunk(9, 1),
     meshStick(),
     meshSlab(),
@@ -1339,12 +1505,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     meshStick(true),
     meshSlab(),
   );
-  const M_BIRD = add(meshBird()),
-    M_FLY = add(meshFlyer(0), meshFlyer(1)),
-    M_FLY_FAR = add(meshFlyer(0, true), meshFlyer(1, true)),
-    M_SONG = add(
-      meshSongbird(false),
-      meshSongbird(true),
+  const M_JAY = add(
       meshJayNear(false),
       meshJayNear(true),
       meshRaven(false),
@@ -1375,10 +1536,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // side paths, in the middle of the longest
   // (so many jays: all but the side paths' along the loop, as far apart as there is room for and JAY_SPACING at
   // the least if that fits, less if it does not; 11: where they lived when there were eleven)
+  const JAY_SPECIES = 0; // the jay's index in birds.js SPECIES
   const jayHomes = (count) => {
     if (count >= 11)
       return [5, 34, 62, 96, 128, 160, 200, 244, 288, 326, 358].map((k) =>
-        home(TRAIL[k][0], TRAIL[k][1], 28, 1, 3),
+        home(TRAIL[k][0], TRAIL[k][1], 28, 1, JAY_SPECIES),
       );
     const want = max(count - JAYS_ON_SIDE_PATHS, 0);
     let found = [];
@@ -1403,10 +1565,9 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       .sort((a, b) => b.length - a.length)
       .slice(0, min(JAYS_ON_SIDE_PATHS, count))
       .forEach((path) => found.push(path[path.length >> 1]));
-    return found.map((at) => home(at[0], at[1], 22, 1, 3));
+    return found.map((at) => home(at[0], at[1], 22, 1, JAY_SPECIES));
   };
-  // The birds (birds.js): a flock of juncos feeding on and beside the first stretch of trail past the first
-  // bridge; in the trees two parties of chickadees, two varied thrushes, four Steller's jays
+  // The birds (birds.js): JAYS Steller's jays at their homes along the paths (jayHomes) and the pair of ravens
   const birds = makeBirds({
     ground,
     avoid: (x, z, pad) => {
@@ -1434,7 +1595,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         .filter((top) => inWoods(top[0], top[2]))
         .flat(),
     ),
-    // (jays only for now: the smaller birds' homes are left out)
     homes: jayHomes,
     // (on the boardwalk or the dock, at the lake's edge, or in a clearing; a creek in the woods is no bar)
     open: (x, z) =>
@@ -1469,25 +1629,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     veil: (x, y, z, dx, dy, dz, far) => veilFrom(x, y, z, dx, dy, dz, 200, far),
     count: JAYS,
   });
-  // Deer, a fox, squirrels, owls and ducks: rigid parts moved every frame (creatures.js), in their own buffer.
-  // Squirrels get the big conifers nearest the trail (their radius a little up the trunk), owls the nearest snags
-  const byTrail = (list, n) =>
-    list
-      .slice()
-      .sort((a, b) => trailD(a.x, a.z) - trailD(b.x, b.z))
-      .slice(0, n);
-  const critters = ANIMALS
-    ? makeCreatures({
-        add,
-        ground,
-        avoid: (x, z, pad) => {
-          shove(x, z, pad);
-          return [P2[0], P2[1]];
-        },
-        trunks: byTrail(Wd.trees, 12).map((t) => ({ ...t, r: t.r * 0.9 })),
-        snags: byTrail(Wd.snags, 6),
-      })
-    : { data: new Float32Array(12), groups: [], update() {} };
   // ---------------------------------------------------------------- deer (deer.js)
   // Is the line from a to b (an eye and a deer) hidden: by a trunk (every disc of the walker's obstacles over 0.2 m
   // across its true radius, obst padding them, between the ends), or by the forest it runs through (what Wd.occ
@@ -1687,7 +1828,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   solidData.set(Wd.solids.data);
   solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
   const ibSolids = buf(solidData, BU.VERTEX),
-    ibCreature = buf(critters.data, BU.VERTEX),
     ibBoat = device.createBuffer({ size: 48, usage: BU.VERTEX | BU.COPY_DST }),
     BOAT = new Float32Array(12),
     // Soft dark patches on the lake: three along the boat, one round each pile. They lie a hand under the water's
@@ -1738,7 +1878,9 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   const ibChunk = Wd.chunks.map((c) => buf(c.data, BU.VERTEX)),
     ibProp = Wd.props.map((c) => buf(c.data, BU.VERTEX)),
     ibBoulder = Wd.boulders.map((c) => buf(c.data, BU.VERTEX));
-  const leafBuf = (set) => set && buf(new Uint8Array(set.buf), BU.VERTEX);
+  // (Low: read too by its cards' light at load, W_LEAF_LIGHT)
+  const leafBuf = (set) =>
+    set && buf(new Uint8Array(set.buf), BU.VERTEX | (LOW ? BU.STORAGE : 0));
   const ibHigh = leafBuf(Wd.high),
     ibBigF = leafBuf(Wd.bigF),
     ibLow = leafBuf(Wd.low),
@@ -1750,18 +1892,13 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     ibBigL = leafBuf(Wd.bigL),
     ibLowM = leafBuf(Wd.lowM),
     ibSmallL = leafBuf(Wd.smallL);
-  const ibFish = buf(Wd.fish, BU.VERTEX),
-    ibBirds = buf(Wd.mantas, BU.VERTEX),
-    ibSnowB = buf(Wd.snow, BU.VERTEX);
-  const ibGl = buf(Wd.glints.data, BU.VERTEX);
+  const ibSnowB = buf(Wd.snow, BU.VERTEX);
   const vbSign = buf(Wd.labels, BU.VERTEX),
     nSign = Wd.labels.length / 8;
   const vbWater = buf(water.vb, BU.VERTEX),
     ibWater = buf(water.ib, BU.INDEX),
     nWater = water.ib.length;
-  const nBird = Wd.mantas.length / 8,
-    BIRD = meshes[M_BIRD],
-    WOOD = meshes[M_WOOD],
+  const WOOD = meshes[M_WOOD],
     woodAt = Wd.woodAt;
   facts.world = `${Wd.props.reduce((n, c) => n + c.n, 0)} trees, ${Wd.low.n + Wd.high.n} leaves, ${(nI / 3) | 0} mesh triangles`;
 
@@ -1792,13 +1929,60 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   }
 
   // ---------------------------------------------------------------- one-time bakes: foliage atlas, detail texture, shadow map
+  // RULE: no single GPU job at load may run long. An Adreno 6xx took 2 s and more for the foliage atlas as one job and
+  // its driver dropped the device (VK_ERROR_DEVICE_LOST). So every load-time bake is cut into small pieces, each
+  // submitted and awaited through bakePiece (the atlas's tiles, the shadow's runs, Low's floor tiles and card lights;
+  // the density slabs above alike): a new bake must follow the same pattern. facts.bake: each piece's wait in ms by
+  // name, then the piece in flight (now), so a loss names it
+  const SHADOW_RUN = STEP >= 1 ? 5000 : 40000; // leaf cards a shadow piece draws at most (quality.js STEPS)
+  const baked = []; // [name, ms]
+  let bakeNow = '';
+  // By name, in order: the atlas's and the floor's tiles (and, short, the budget view's line, any name of over 16
+  // pieces) as their count, sum and longest
+  const bakeTimes = (short) => {
+    const byName = new Map();
+    for (const [name, ms] of baked)
+      byName.set(name, [...(byName.get(name) || []), ms]);
+    return [...byName]
+      .map(([name, all]) =>
+        name === 'atlas' ||
+        name === 'floor' ||
+        name === 'lights' ||
+        (short && all.length > 16)
+          ? `${name} x${all.length}: ${all.reduce((a, b) => a + b)} in all, longest ${max(...all)}`
+          : `${name} ${all.join(', ')}`,
+      )
+      .join(' · ');
+  };
+  const bakeFacts = () => {
+    facts.bake = bakeTimes(false) + (bakeNow ? ` · now: ${bakeNow}` : '');
+  };
+  // one piece of a load-time bake: submitted alone and awaited before the next is encoded (the RULE above)
+  const bakePiece = async (name, e, now = name) => {
+    bakeNow = now;
+    bakeFacts();
+    const t0 = performance.now();
+    Q.submit([e.finish()]);
+    await Q.onSubmittedWorkDone();
+    baked.push([name, round(performance.now() - t0)]);
+    performance.measure(`bake ${baked.length}: ${now}`, { start: t0 }); // (each piece's wait, for a profile)
+    bakeNow = '';
+    bakeFacts();
+  };
   // The atlas, layer by layer: each is drawn from the one below (bound whole, with its small levels), then gets its
-  // own small levels. atlasMs: how long it took, from the shader's compiling to the GPU's finishing (debug.atlas)
+  // own small levels. atlasMs: how long it took, from the shader's compiling to the GPU's finishing (debug.atlas).
+  // A layer is drawn in TILE_ROWS x TILE_COLS tiles, each its own submit, waited for: the three layers in one job took
+  // 2 to 5 s on an Adreno 6xx, whose driver's hang check then lost the device (a tile there: some 20 to 50 ms). The
+  // first tile clears the layer and the rest draw over it; the layer's small levels follow, a submit of their own
+  const TILE_ROWS = 16,
+    TILE_COLS = 2;
   let atlasMs = 0;
   {
     const t0 = performance.now(),
       m = mod(W_ATLAS, 'ATLAS'),
-      e = device.createCommandEncoder();
+      tw = ATLAS / TILE_COLS,
+      th = ATLAS / TILE_ROWS,
+      tiles = TILE_ROWS * TILE_COLS;
     const view = (layer, mip) =>
       tAtlas.createView({
         dimension: '2d',
@@ -1807,40 +1991,54 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         baseMipLevel: mip,
         mipLevelCount: mip < 0 ? ATLAS_MIPS : 1,
       });
+    const layerPipes = await compiled(
+      [0, 1, 2].map((l) =>
+        rpipe({
+          layout: plBlit,
+          vertex: { module: m, entryPoint: 'vs' },
+          fragment: {
+            module: m,
+            entryPoint: 'fs' + l,
+            targets: [{ format: 'rgba8unorm' }],
+          },
+        }),
+      ),
+    );
     for (let l = 0; l < 3; l++) {
-      const p = rpipe({
-        layout: plBlit,
-        vertex: { module: m, entryPoint: 'vs' },
-        fragment: {
-          module: m,
-          entryPoint: 'fs' + l,
-          targets: [{ format: 'rgba8unorm' }],
-        },
-      });
+      const p = layerPipes[l];
       // (layer 0 reads nothing: it gets the last layer, which is not being drawn)
       const below = tAtlas.createView({
         dimension: '2d',
         baseArrayLayer: l ? l - 1 : 2,
         arrayLayerCount: 1,
       });
-      let r = e.beginRenderPass({
-        colorAttachments: [colorAtt(view(l, 0), true)],
+      const bg = device.createBindGroup({
+        layout: bglBlit,
+        entries: [
+          { binding: 0, resource: below },
+          { binding: 1, resource: sRep },
+        ],
       });
-      r.setPipeline(p);
-      r.setBindGroup(
-        0,
-        device.createBindGroup({
-          layout: bglBlit,
-          entries: [
-            { binding: 0, resource: below },
-            { binding: 1, resource: sRep },
-          ],
-        }),
-      );
-      r.draw(3);
-      r.end();
+      for (let t = 0; t < tiles; t++) {
+        const e = device.createCommandEncoder();
+        const r = e.beginRenderPass({
+          colorAttachments: [colorAtt(view(l, 0), t === 0)],
+        });
+        r.setPipeline(p);
+        r.setBindGroup(0, bg);
+        r.setScissorRect(
+          (t % TILE_COLS) * tw,
+          ((t / TILE_COLS) | 0) * th,
+          tw,
+          th,
+        );
+        r.draw(3);
+        r.end();
+        await bakePiece('atlas', e, `atlas ${l * tiles + t + 1}/${3 * tiles}`);
+      }
+      const e = device.createCommandEncoder();
       for (let i = 1; i < ATLAS_MIPS; i++) {
-        r = e.beginRenderPass({
+        const r = e.beginRenderPass({
           colorAttachments: [colorAtt(view(l, i), true)],
         });
         r.setPipeline(pMip8);
@@ -1848,24 +2046,24 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         r.draw(3);
         r.end();
       }
+      await bakePiece('atlas mips', e);
     }
-    Q.submit([e.finish()]);
-    Q.onSubmittedWorkDone().then(() => {
-      atlasMs = performance.now() - t0;
-    });
+    atlasMs = performance.now() - t0;
   }
   {
     const m = mod(W_DETAIL, 'DETAIL'),
-      p = rpipe({
-        layout: 'auto',
-        vertex: { module: m, entryPoint: 'vs' },
-        fragment: {
-          module: m,
-          entryPoint: 'fs',
-          targets: [{ format: 'rgba8unorm' }],
-        },
-      });
-    const e = device.createCommandEncoder();
+      [p] = await compiled([
+        rpipe({
+          layout: 'auto',
+          vertex: { module: m, entryPoint: 'vs' },
+          fragment: {
+            module: m,
+            entryPoint: 'fs',
+            targets: [{ format: 'rgba8unorm' }],
+          },
+        }),
+      ]);
+    let e = device.createCommandEncoder();
     let r = e.beginRenderPass({
       colorAttachments: [
         colorAtt(
@@ -1894,16 +2092,26 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       r.draw(3);
       r.end();
     }
-    r = e.beginRenderPass({
-      colorAttachments: [],
-      depthStencilAttachment: {
-        view: tShadow.createView(),
-        depthClearValue: 1,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-      },
-    });
-    r.setBindGroup(0, bg0s);
+    await bakePiece('detail', e);
+    // The shadow map, in pieces each its own submit, waited for: the ground and the solids, the trunks, then the
+    // leaf cards in runs of at most SHADOW_RUN (all of it in one pass, some 3.4M vertices, trips a phone GPU's hang
+    // timeout and loses the device). Each piece after the first draws over the map as it was left
+    let first = true;
+    const shadowPass = () => {
+      e = device.createCommandEncoder();
+      r = e.beginRenderPass({
+        colorAttachments: [],
+        depthStencilAttachment: {
+          view: tShadow.createView(),
+          depthClearValue: 1,
+          depthLoadOp: first ? 'clear' : 'load',
+          depthStoreOp: 'store',
+        },
+      });
+      first = false;
+      r.setBindGroup(0, bg0s);
+    };
+    shadowPass();
     r.setPipeline(pTerrSh);
     r.setVertexBuffer(0, terr[0].vb);
     r.setVertexBuffer(1, ibSolids);
@@ -1930,19 +2138,307 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           0,
         );
       }
+    r.end();
+    await bakePiece('ground', e);
+    shadowPass();
+    r.setPipeline(pSolidSh);
+    r.setVertexBuffer(0, vbMesh);
+    r.setIndexBuffer(ibMesh, 'uint32');
     for (let i = 0; i < NTRUNK; i++)
       if (Wd.props[i].n) {
         const t = meshes[M_TRUNK + i];
         r.setVertexBuffer(1, ibProp[i]);
         r.drawIndexed(t.ib.length, Wd.props[i].n, t.i0, t.v0, 0);
       }
-    r.setPipeline(pLeafSh);
-    r.setVertexBuffer(0, ibLow);
-    r.draw(6, Wd.low.n);
-    r.setVertexBuffer(0, ibHigh);
-    r.draw(6, Wd.high.n);
     r.end();
-    Q.submit([e.finish()]);
+    await bakePiece('trunks', e);
+    // (from the start guard's step 2 on, no leaf casts a shadow: quality.js STEPS)
+    const leafRuns =
+      STEP >= 2
+        ? []
+        : [
+            [ibLow, Wd.low.n],
+            [ibHigh, Wd.high.n],
+          ].flatMap(([cards, n]) =>
+            Array.from({ length: Math.ceil(n / SHADOW_RUN) }, (_, k) => [
+              cards,
+              k * SHADOW_RUN,
+              min(SHADOW_RUN, n - k * SHADOW_RUN),
+            ]),
+          );
+    for (const [k, [cards, from, n]] of leafRuns.entries()) {
+      shadowPass();
+      r.setPipeline(pLeafSh);
+      r.setVertexBuffer(0, cards);
+      r.draw(6, n, 0, from);
+      r.end();
+      await bakePiece('leaves', e, `leaves ${k + 1}/${leafRuns.length}`);
+    }
+  }
+  // ---------------------------------------------------------------- the Low tier's ground bake
+  // Low draws its ground from textures baked here, once (W_SOLID fsBake, after the shadow: it is in the light): the
+  // terrain seen from straight above, GROUND_TILE x GROUND_TILE cells a tile, each its own waited submit (the phone's
+  // rule: no long GPU job), into tGround (GROUND_PX square: the albedo's square root and the sun's share), tGroundAmb
+  // (the ambient's parts) and tGroundNear (where the near layers go): these two baked at that size with it and kept
+  // at half
+  const GROUND_PX = 2048,
+    GROUND_TILE = 2;
+  let bgGround = null;
+  if (LOW) {
+    const N = GROUND_PX,
+      per = N / CELLS,
+      levels = (n) => floor(Math.log2(n)) + 1,
+      tGround = tex(
+        N,
+        N,
+        'rgba8unorm',
+        TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING,
+        {
+          mips: levels(N),
+        },
+      ),
+      tAmbFull = tex(
+        N,
+        N,
+        'rgba8unorm',
+        TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.COPY_SRC,
+        { mips: levels(N) },
+      ),
+      tNearFull = tex(
+        N,
+        N,
+        'rgba8unorm',
+        TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.COPY_SRC,
+        { mips: levels(N) },
+      ),
+      half = () =>
+        tex(N / 2, N / 2, 'rgba8unorm', TU.TEXTURE_BINDING | TU.COPY_DST, {
+          mips: levels(N / 2),
+        }),
+      tGroundAmb = half(),
+      tGroundNear = half();
+    const [pBake] = await compiled([
+      rpipe({
+        layout: pl0,
+        vertex: {
+          module: mSolid,
+          entryPoint: 'vs',
+          buffers: [vbSolid, ibSolid],
+        },
+        fragment: {
+          module: mSolid,
+          entryPoint: 'fsBake',
+          targets: [
+            { format: 'rgba8unorm' },
+            { format: 'rgba8unorm' },
+            { format: 'rgba8unorm' },
+          ],
+        },
+      }),
+    ]);
+    // its G: the frame's as it stands (the sun is set), seen from straight above the whole map, the knobs as today
+    const ub = UB.slice(),
+      W0 = NX * VS;
+    ub.set(
+      [
+        2 / W0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        -2 / W0,
+        0,
+        0,
+        -1 - (2 * OX) / W0,
+        1 + (2 * OZ) / W0,
+        0.5,
+        1,
+      ],
+      0,
+    );
+    ub.set([OX + W0 / 2, 1000, OZ + W0 / 2, F[TIME]], 32);
+    ub.set([N, N, 1 / N, 1 / N], 52);
+    ub[58] = 1;
+    ub.set([1, 1, 4, 1], 100);
+    const uboBake = device.createBuffer({
+      size: 416,
+      usage: BU.UNIFORM | BU.COPY_DST,
+    });
+    Q.writeBuffer(uboBake, 0, ub);
+    const bgBake = mkBG0(uboBake, tShadow),
+      level = (t, i) => t.createView({ baseMipLevel: i, mipLevelCount: 1 }),
+      across = CELLS / GROUND_TILE,
+      tiles = across * across;
+    {
+      // (cleared first, a submit of its own: in the first tile it made that one ten times the others)
+      const e = device.createCommandEncoder();
+      e.beginRenderPass({
+        colorAttachments: [
+          colorAtt(level(tGround, 0), true),
+          colorAtt(level(tAmbFull, 0), true),
+          colorAtt(level(tNearFull, 0), true),
+        ],
+      }).end();
+      await bakePiece('floor clear', e);
+    }
+    for (let t = 0; t < tiles; t++) {
+      const tx = (t % across) * GROUND_TILE,
+        tz = floor(t / across) * GROUND_TILE,
+        e = device.createCommandEncoder();
+      const r = e.beginRenderPass({
+        colorAttachments: [
+          colorAtt(level(tGround, 0), false),
+          colorAtt(level(tAmbFull, 0), false),
+          colorAtt(level(tNearFull, 0), false),
+        ],
+      });
+      r.setPipeline(pBake);
+      r.setBindGroup(0, bgBake);
+      r.setVertexBuffer(0, terr[0].vb);
+      r.setVertexBuffer(1, ibSolids);
+      r.setIndexBuffer(terr[0].ib, 'uint32');
+      r.setScissorRect(
+        tx * per,
+        tz * per,
+        GROUND_TILE * per,
+        GROUND_TILE * per,
+      );
+      // (the tile's cells and the ring round them: a triangle may reach over its cell's edge)
+      for (let z = max(tz - 1, 0); z < min(tz + GROUND_TILE + 1, CELLS); z++)
+        for (
+          let x = max(tx - 1, 0);
+          x < min(tx + GROUND_TILE + 1, CELLS);
+          x++
+        ) {
+          const a = terr[0].start[z * CELLS + x],
+            b = terr[0].start[z * CELLS + x + 1];
+          if (b > a) r.drawIndexed((b - a) * 6, 1, a * 6, 0, nSolid);
+        }
+      r.end();
+      await bakePiece('floor', e, `floor ${t + 1}/${tiles}`);
+    }
+    // their small levels (a submit each), then the ambient's kept from its second level on
+    for (const texture of [tGround, tAmbFull, tNearFull]) {
+      const e = device.createCommandEncoder();
+      for (let i = 1; i < levels(N); i++) {
+        const r = e.beginRenderPass({
+          colorAttachments: [colorAtt(level(texture, i), true)],
+        });
+        r.setPipeline(pMip8);
+        r.setBindGroup(0, blitBG(level(texture, i - 1)));
+        r.draw(3);
+        r.end();
+      }
+      await bakePiece('floor mips', e);
+    }
+    const e = device.createCommandEncoder();
+    for (const [from, to] of [
+      [tAmbFull, tGroundAmb],
+      [tNearFull, tGroundNear],
+    ])
+      for (let i = 1; i < levels(N); i++)
+        e.copyTextureToTexture(
+          { texture: from, mipLevel: i },
+          { texture: to, mipLevel: i - 1 },
+          [N >> i, N >> i],
+        );
+    await bakePiece('floor mips', e);
+    tAmbFull.destroy();
+    tNearFull.destroy();
+    uboBake.destroy();
+    bgGround = device.createBindGroup({
+      layout: bglGround,
+      entries: [
+        { binding: 0, resource: tGround.createView() },
+        { binding: 1, resource: tGroundAmb.createView() },
+        { binding: 3, resource: tGroundNear.createView() },
+        {
+          binding: 2,
+          resource: device.createSampler({
+            magFilter: 'linear',
+            minFilter: 'linear',
+            mipmapFilter: 'linear',
+            maxAnisotropy: 4,
+          }),
+        },
+      ],
+    });
+  }
+  // ---------------------------------------------------------------- the Low tier's card lights
+  // Low's cards and strips take their light from a record each (W_LEAF_LIGHT, after the shadow), worked out here once
+  // per store, CARD_RUN cards a job, each its own waited submit; drawn with ibQuads, a card's two quads as indices
+  const lightOf = new Map(),
+    ibQuads = LOW
+      ? buf(new Uint16Array([0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7]), BU.INDEX)
+      : null;
+  if (LOW) {
+    const CARD_RUN = 32768,
+      [pLight] = await compiled([
+        cpipe({
+          layout: 'auto',
+          compute: {
+            module: mod(W_LEAF_LIGHT, 'LEAF_LIGHT'),
+            entryPoint: 'main',
+          },
+        }),
+      ]),
+      lg = new Float32Array(24),
+      run = new Uint32Array(lg.buffer, 80, 4),
+      uboLight = device.createBuffer({
+        size: lg.byteLength,
+        usage: BU.UNIFORM | BU.COPY_DST,
+      });
+    lg.set(UB.subarray(16, 32), 0);
+    lg.set(UB.subarray(48, 52), 16);
+    for (const cards of [
+      ibLow,
+      ibLowM,
+      ibHigh,
+      ibBigF,
+      ibBigL,
+      ibShrub,
+      ibShrubF,
+      ibLimb,
+      ibSmall,
+      ibSmallF,
+      ibSmallL,
+    ]) {
+      const n = cards ? cards.size / 36 : 0;
+      if (!n) continue;
+      const lights = device.createBuffer({
+        size: n * 4,
+        usage: BU.VERTEX | BU.STORAGE,
+      });
+      lightOf.set(cards, lights);
+      const bg = device.createBindGroup({
+        layout: pLight.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uboLight } },
+          { binding: 1, resource: { buffer: cards } },
+          { binding: 2, resource: { buffer: lights } },
+          { binding: 3, resource: tShadow.createView() },
+          { binding: 4, resource: tVol.createView() },
+          { binding: 5, resource: sClamp },
+        ],
+      });
+      for (let from = 0; from < n; from += CARD_RUN) {
+        run[0] = from;
+        run[1] = min(CARD_RUN, n - from);
+        Q.writeBuffer(uboLight, 0, lg);
+        const e = device.createCommandEncoder(),
+          c = e.beginComputePass();
+        c.setPipeline(pLight);
+        c.setBindGroup(0, bg);
+        c.dispatchWorkgroups(Math.ceil(run[1] / 64));
+        c.end();
+        await bakePiece('lights', e);
+      }
+    }
+    uboLight.destroy();
   }
   // the GPU has its own copies now: let go of the generator's (but for the far pictures', sorted every frame)
   for (const o of [
@@ -1957,7 +2453,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     Wd.small,
     Wd.smallF,
     Wd.smallL,
-    Wd.glints,
     ...Wd.chunks,
     ...Wd.props,
     ...Wd.boulders,
@@ -1975,7 +2470,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       skyGrid[i + (NX / 2) * j] =
         Wd.volD[(i + (NX / 2) * (iy + (NY / 2) * j)) * 2 + 1] / 255;
     }
-  // the old rule: what the exposure is to be times at a place: 1 in the open, up to 1.4 in deep shade
+  // the old rule (still the base of today's exposure, which stops it down for highlights: exposureOf): what the
+  // exposure is to be times at a place: 1 in the open, up to 1.4 in deep shade
   const adaptAt = (x, z) => {
     const s =
         skyGrid[
@@ -2000,15 +2496,65 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       0;
 
   // ---------------------------------------------------------------- render targets (rebuilt on resize)
-  // The scene is drawn at `pix` pixels and scaled up to the window. frame() tunes it and the draw distance scale `det`
-  // for 60 fps; both start where the last visit left them, but on a dev machine, where nothing is kept, so that a
-  // slow moment there never sticks.
-  // phones may go lower in pixels and draw distance before the frame rate gives way: their GPUs run out first
+  // The scene is drawn at `pix` pixels and scaled up to the window. frame() tunes `pix` to the frame's time at the
+  // paced rate (TARGET, 30 fps); `det`, how far the fog lets the eye see, is only the Try knob d's. pix starts where
+  // the last visit left it (forestTierSize), but on a dev machine, where nothing is kept, so a slow moment there never
+  // sticks.
+  // phones may go lower in pixels before the frame rate gives way: their GPUs run out first
   const PIXMAX = 2560 * 1440,
-    PIXMIN = mob ? 18e4 : 5e5,
-    PIX0 = MEDIUM ? (mob ? 1280 * 720 : PIXMAX) : 41e4; // the level's own
+    PIXMIN = mob ? 18e4 : 5e5, // (the Try knob r may set another: pixMin)
+    PIX0 = HIGH ? (mob ? 1280 * 720 : PIXMAX) : 41e4; // the tier's own
   // a phone's 3x screen gains little over 2x in this soft, hazy scene, at more than twice the pixels
   const DPRMAX = 2;
+  // The Try knobs (the budget view): live switches, each kept on this device (forestTry: the short code the view
+  // prints, e.g. "d50 f15 l50 p50 s4 w1 n1 r120 fx1111"). d: the view's length % (det: the fog closes that much
+  // nearer, and every end that follows the fog with it, lodNow: nothing ends while the fog still shows it); f: from
+  // how many metres the trees are their far pictures (lodNow);
+  // l, p: the share % of the trees' cards and of the plants kept, by rank (W_LEAF thin, and the cuts that follow);
+  // s: the ground's shadow taps (W_SOLID shadow9); w: sway; n: the near sprays (vsN); r: the render size's floor (k
+  // px, the tuner); fx: shafts, bloom, the water's motion, metering (0 off; metering off: the old exposure rule).
+  // The first value of each is today's
+  const KNOBS = {
+    d: [100, 70, 50, 35],
+    f: [38, 26, 18, 12],
+    l: [100, 75, 50, 25],
+    p: [100, 50, 25, 0],
+    s: HIGH ? [9, 4, 1] : [4, 9, 1],
+    w: [1, 0],
+    n: [1, 0],
+    r: mob ? [180, 120, 90] : [500, 180, 120, 90],
+    fx: ['1111'],
+  };
+  const kn = Object.fromEntries(
+    Object.entries(KNOBS).map(([key, values]) => [key, values[0]]),
+  );
+  const knobCode = () =>
+    Object.keys(KNOBS)
+      .map((key) => key + kn[key])
+      .join(' ');
+  let pixMin = PIXMIN,
+    atFloor = false;
+  // sets a knob (a value of its list; f any number of metres, for a measure) and applies it; keep: remember it here
+  function setKnob(key, value, keepIt = true) {
+    if (!(key in KNOBS)) return;
+    if (key === 'fx')
+      value = String(value).replace(/[^01]/g, '').padEnd(4, '1').slice(0, 4);
+    else if (!KNOBS[key].includes(+value) && key !== 'f') return;
+    kn[key] = key === 'fx' ? value : +value;
+    det = kn.d / 100;
+    pixMin = kn.r * 1e3;
+    OFF.shafts = kn.fx[0] === '0';
+    OFF.bloom = kn.fx[1] === '0';
+    OFF.waterMotion = kn.fx[2] === '0';
+    OFF.metering = kn.fx[3] === '0';
+    if (keepIt) keep('forestTry', knobCode());
+  }
+  function tryCode(code) {
+    for (const key of Object.keys(KNOBS)) setKnob(key, KNOBS[key][0], false);
+    for (const [, key, value] of String(code || '').matchAll(/([a-z]+)(\d+)/g))
+      setKnob(key, value, false);
+    keep('forestTry', knobCode());
+  }
   // tan of half the field of view: vertical TANH (set by resize) and the horizontal floor TANW for a tall screen
   const TANH0 = 0.6,
     TANW = 0.48;
@@ -2026,15 +2572,22 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     dynBad = 0,
     dynOk = 0,
     dynWait = 3;
-  // Medium is judged in its first JUDGE s of measured frames: drawn under SLOW_SIZE of its own render size (as much
-  // of it as the screen has) for SLOW_FOR s in a row, or over budget at the smallest size as long, it is too slow,
-  // and this device runs Low from its next load on (quality.js)
+  // High and Medium (not Low: nothing is under it) are judged in their first JUDGE s of measured frames: drawn under
+  // SLOW_SIZE of its own render size (as much of it as the screen has) for SLOW_FOR s in a row, or over budget at the
+  // smallest size as long, it is too slow, and this device runs the tier under from its next load on. A Medium start
+  // that may be promoted (quality.js PROMOTABLE) is watched as long for room: holding the full render size (as much as
+  // the screen has, to PIXMAX) with the GPU's time and this thread's both under half a frame's time for ROOM_FOR s in
+  // a row, it has room, and runs High from its next load on. decided: what came of either, for the budget view
   const JUDGE = 60,
     SLOW_SIZE = 0.7,
-    SLOW_FOR = 5;
-  let judged = MEDIUM ? 0 : JUDGE,
+    SLOW_FOR = 5,
+    ROOM_FOR = 10;
+  let judged = LOW ? JUDGE : 0,
     smallFor = 0,
-    starvedFor = 0;
+    starvedFor = 0,
+    roomFor = 0,
+    dynC = 0,
+    decided = '';
   let passScene,
     passRays,
     passBlur,
@@ -2046,7 +2599,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     bloomPass = [],
     bloomBG = [],
     targets = [];
-  const NB = MEDIUM ? 6 : 4; // bloom levels: each is two render passes, and a phone GPU pays by the pass
+  const NB = HIGH ? 6 : 4; // bloom levels: each is two render passes, and a phone GPU pays by the pass
   function resize() {
     const dpr = min(devicePixelRatio, DPRMAX);
     DW = max(2, round(canvas.clientWidth * dpr));
@@ -2057,7 +2610,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     const w = max(2, round(DW * s) & ~1),
       h = max(2, round(DH * s) & ~1);
     if (w === W && h === H) return;
-    dynN = dynG = dynGN = 0;
+    dynN = dynG = dynGN = dynC = 0;
     dynT = -300; // let the new size settle before measuring again
     W = w;
     H = h;
@@ -2094,7 +2647,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       vRay = tRay.createView(),
       vRay2 = tRay2.createView(),
       vBl = bl.map((t) => t.createView());
-    // without anti-aliasing (Low) the scene goes straight into the resolve target, and tMS is one unused column
+    // without anti-aliasing (below High) the scene goes straight into the resolve target, and tMS is one unused column
     passScene = {
       colorAttachments: [
         {
@@ -2184,6 +2737,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   addEventListener('resize', resize);
 
   // ---------------------------------------------------------------- timing (GPU timestamp queries)
+  // The GPU's time for a frame (F[GPU], and the tuner's sum): by the timestamp queries where the device has them,
+  // else the time from the frame's submit to the GPU's done (render: paced frames find the GPU idle at the submit)
+  const gpuTook = (ms) => {
+    F[GPU] = ms;
+    if (dynT > 0 && ms > 0 && ms < 1e3) {
+      dynG += ms;
+      dynGN++;
+    }
+  };
   let qs,
     qResolve,
     qRead = [],
@@ -2203,14 +2765,9 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       const o = { b, busy: false, done: null };
       o.done = () => {
         const a = new BigInt64Array(b.getMappedRange());
-        const ms = Number(a[1] - a[0]) / 1e6;
-        F[GPU] = ms;
+        gpuTook(Number(a[1] - a[0]) / 1e6);
         b.unmap();
         o.busy = false;
-        if (dynT > 0 && ms > 0 && ms < 1e3) {
-          dynG += ms;
-          dynGN++;
-        }
       };
       qRead.push(o);
     }
@@ -2228,26 +2785,28 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     EXPO = 0.6,
     RAYS = 1;
   // Exposure (W_POST): the old rule's, by how much sky reaches the walker, stopped down while the highlights in
-  // view (W_METER, adapted) times it would go over HIGH: their value on the walk's opening view (debug.trail(0, 10),
+  // view (W_METER, adapted) times it would go over HIGHLIGHTS: their value on the walk's opening view (debug.trail(0, 10),
   // clear, the eye settled: EXPO_OPEN), the brightest the scene allows; OPEN_HIGH, those highlights as
   // debug.exposureNow measured them at each level (the mean of 40 s)
   const EXPO_OPEN = EXPO * (1 + 0.9 * MIST) * adaptAt(TRAIL[0][0], TRAIL[0][1]),
     OPEN_HIGH = lv(0.4654, 0.4677),
-    HIGH = EXPO_OPEN * OPEN_HIGH;
+    HIGHLIGHTS = EXPO_OPEN * OPEN_HIGH;
   // the exposure in use, by debug.exposure's mode, from the old rule's (place) and the highlights adapted to
   const exposureOf = (place, high) =>
-    expoMode ? place : place * clamp(HIGH / (place * high), 0.4, 1);
+    expoMode ? place : place * clamp(HIGHLIGHTS / (place * high), 0.4, 1);
   const submitList = [null];
   const rowOrd = new Uint8Array(CELLS);
-  // Where things swap meshes or stop (metres, scaled by `det` like every distance but the ground's and the trees')
+  // Where things swap meshes or stop (metres)
   const TERR_FAR = lv([34, 60], [44, 68]); // ground: to its 1/4 and 1/16 meshes
   // (the far meshes come in deep in the fog, where the change of outline is a pixel or two)
   const BOULDER = lv([14, 40], [14, 56]); // boulders, logs and stumps: to their middle mesh, then the far one
   const CHUNK = lv([12, 16, 40], [16, 16, 56]); // small rocks and mushrooms to their 20-odd triangles; large rocks to 1/4, then to 20
   const CHUNK_END = lv(48, 96); // small rocks and mushrooms stop here (world.js gives the rocks the same fade)
   const PEBBLE = lv([1, 12], [1, 24]); // pebbles: as 20 triangles?, and how far
-  const FLY_NEAR = lv(20, 50),
-    GLINT_END = lv(60, 90);
+  // How far across from where its limb or trunk is filed a tree's card may lie (world.js broadleaf: the crown's
+  // radius, at most 0.36 of 18 m, and its lean; a conifer's bough on its leaning trunk): limbs and trunks are culled
+  // that much more loosely than the cards, so a card is never drawn without what it hangs from
+  const REACH = 7.5;
   const SPRITES = lv([2500, 3500, 500, 260], [6000, 7000, 900, 500]); // dust, raindrops, falling leaves, drips (of Wd.snow)
   // D(v): where the fog of the moment lets v through along a level ray (hazeT in S_G, from G.wx.w and G.st.y)
   const hazeNow = () =>
@@ -2266,11 +2825,15 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     return d[0] + (d[1] - d[0]) * (0.5 - sin(Math.asin(1 - 2 * f) / 3));
   };
   // A store's set of the cards of rank under c (world.js lowRank: .75, .53, .27, .18) is drawn from where the
-  // shader shows none over it: its share down to c, less the .03 the set holds over for rounding
-  const cutAt = (s, d, c) => shareAt(s, d, max(c - 0.03, s.KMIN));
+  // shader shows none over it: its share (times keep, the Try knob's) down to c, less the .03 the set holds over
+  // for rounding; from the start where even its first share is that low
+  const cutAt = (s, d, c, keep = 1) =>
+    keep * s.K0 <= c - 0.03 ? 0 : shareAt(s, d, max((c - 0.03) / keep, s.KMIN));
+  // the Try knobs' shares kept of a store: the trees' cards (STORE 1), or the plants'
+  const keepOf = (s) => (s.STORE === 1 ? kn.l : kn.p) / 100;
   // W_LEAF thin mirrored: a card's width times at cd metres (its size is 1 at every distance)
   const thinW = (s, d, rank, cd) => {
-    const k = mix(s.K0, s.KMIN, sstep(d[0], d[1], cd)),
+    const k = mix(s.K0, s.KMIN, sstep(d[0], d[1], cd)) * keepOf(s),
       r = sqrt(d[2] / d[3]),
       h = sin(rank * 31.7 * 127.1) * 43758.5453,
       end = d[3] * mix(r, 1, h - floor(h));
@@ -2283,9 +2846,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         if (thinW(s, d, min(i / 2048, 0.999999), cd) !== 1) return fogV(cd);
     return 0;
   };
-  const SMALL_D = [THIN_SMALL.PD1, THIN_SMALL.PD2],
-    SMALL_F = cutAt(THIN_SMALL, SMALL_D, 0.53),
-    SMALL_L = cutAt(THIN_SMALL, SMALL_D, 0.18);
+  const SMALL_D = [THIN_SMALL.PD1, THIN_SMALL.PD2];
   // The fog's distances now (G.lt, G.ls, G.lf) and the cuts of LEAVES that follow them, for every frame. The far
   // trees' pictures (far: where they begin to come in and are whole, as the trees' cards thin) are drawn to where
   // the fog has closed (farSorted); so are the ground plants, a card's reach (2.5 m) on. (The fog's close is drawn
@@ -2295,55 +2856,79 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       shrub: new Float64Array(4),
       far: TREE_CLEAR.slice(0, 2),
       close: [0, 0],
+      // where the fog has closed over everything, whichever way the eye looks (sight: nearer, no cell is left out as
+      // hidden)
+      seen: FOG_END,
     },
     TIER = {};
   const lodNow = () => {
     const t = LOD.tree,
-      s = LOD.shrub;
-    const q = min(1, FOG_END / fogD(CLOSE[1]));
+      s = LOD.shrub,
+      kl = keepOf(THIN_TREE),
+      kp = keepOf(THIN_SHRUB);
+    // (the fog closes by FOG_END, or by that much less with the Try knob d)
+    const q = min(1, (FOG_END * det) / fogD(CLOSE[1]));
     LOD.close[0] = fogD(CLOSE[0]) * q;
     LOD.close[1] = fogD(CLOSE[1]) * q;
+    LOD.seen = LOD.close[1];
     // the clear day's thinning; the trees' cards end in the closed fog, the shrubs' as on a clear day or there
     t.set(TREE_CLEAR);
     t[2] = LOD.close[1];
     t[3] = FOG_END + 1;
     s.set(SHRUB_CLEAR);
+    LOD.far[0] = TREE_CLEAR[0];
+    LOD.far[1] = TREE_CLEAR[1];
+    // (Try knob f: the trees thin and their pictures come in that much nearer, and their cards end where the
+    // pictures are whole)
+    const near = kn.f === KNOBS.f[0] ? 1 : kn.f / TREE_CLEAR[0];
+    if (near < 1) {
+      t[0] = LOD.far[0] = TREE_CLEAR[0] * near;
+      t[1] = LOD.far[1] = TREE_CLEAR[1] * near;
+      t[2] = t[0];
+      t[3] = t[1];
+    }
     TIER.plant = min(PLANT_END, LOD.close[1] + 2.5);
-    TIER.tree = drawEnd(5);
-    TIER.lowM = min(max(NEAR_D, cutAt(THIN_TREE, t, 0.75)), TIER.tree);
-    TIER.bigF = min(max(TIER.lowM, cutAt(THIN_TREE, t, 0.53)), TIER.tree);
-    TIER.bigL = min(cutAt(THIN_TREE, t, 0.27), TIER.tree);
+    TIER.tree = near < 1 ? min(drawEnd(5), t[3]) : drawEnd(5);
+    // (a limb is filed by its root, up to REACH from the cards on it: drawn that much further, so none goes
+    // without it)
+    TIER.limb = TIER.tree + REACH;
+    TIER.lowM = min(max(NEAR_D, cutAt(THIN_TREE, t, 0.75, kl)), TIER.tree);
+    TIER.bigF = min(max(TIER.lowM, cutAt(THIN_TREE, t, 0.53, kl)), TIER.tree);
+    TIER.bigL = min(cutAt(THIN_TREE, t, 0.27, kl), TIER.tree);
     TIER.farEnd = drawEnd(9);
     TIER.shrub = min(s[3], drawEnd(2.5));
-    TIER.shrubF = min(max(NEAR_D, cutAt(THIN_SHRUB, s, 0.53)), TIER.shrub);
+    TIER.shrubF = min(max(NEAR_D, cutAt(THIN_SHRUB, s, 0.53, kp)), TIER.shrub);
+    TIER.smallF = cutAt(THIN_SMALL, SMALL_D, 0.53, kp);
+    TIER.smallL = cutAt(THIN_SMALL, SMALL_D, 0.18, kp);
   };
-  // leaves: pipeline, buffer, set, margin, vertices per blade, from, to (metres, or the name of a cut in TIER). A
-  // tree's or a shrub's card is SPRIGS quads within NEAR_D and its first two beyond (W_LEAF vsN: the others are
-  // folded away by then; the trees' cards high in a crown, Wd.high, never have more). Further off each store is
-  // drawn whole up to where the shader has thinned away its cards of rank over a half, then only those under
-  // (Wd.bigF, shrubF, smallF), and from where it has thinned them to their least a third set (bigL, smallL); the
-  // trees' low cards have one of three quarters before that (lowM). So no cut, made by sub-cell, ever shows
+  // leaves: pipeline, buffer, set, margin, vertices per blade ('near': SPRIGS quads, or two with the Try knob n off),
+  // from, to (metres, or the name of a cut in TIER), and the cells seen (vis unless given). A tree's or a shrub's card
+  // is SPRIGS quads within NEAR_D and its first two beyond (W_LEAF vsN: the others are folded away by then; the trees'
+  // cards high in a crown, Wd.high, never have more). Further off each store is drawn whole up to where the shader has
+  // thinned away its cards of rank over a half, then only those under (Wd.bigF, shrubF, smallF), and from where it has
+  // thinned them to their least a third set (bigL, smallL); the trees' low cards have one of three quarters before
+  // that (lowM). So no cut, made by sub-cell, ever shows
   const LEAVES = [
-    [pLeafM, ibLow, Wd.low, 5, SPRIGS * 6, 0, NEAR_D],
+    [pLeafM, ibLow, Wd.low, 5, 'near', 0, NEAR_D],
     [pLeafM, ibLow, Wd.low, 5, 12, NEAR_D, 'lowM'],
     [pLeafM, ibLowM, Wd.lowM, 5, 12, 'lowM', 'bigF'],
     [pLeafM, ibHigh, Wd.high, 5, 12, 0, 'bigF'],
     [pLeafM, ibBigF, Wd.bigF, 5, 12, 'bigF', 'bigL'],
     [pLeafM, ibBigL, Wd.bigL, 5, 12, 'bigL', 'tree'],
-    [pLeafMS, ibShrub, Wd.shrub, 2.5, SPRIGS * 6, 0, NEAR_D],
+    [pLeafMS, ibShrub, Wd.shrub, 2.5, 'near', 0, NEAR_D],
     [pLeafMS, ibShrub, Wd.shrub, 2.5, 12, NEAR_D, 'shrubF'],
     [pLeafMS, ibShrubF, Wd.shrubF, 2.5, 12, 'shrubF', 'shrub'],
-    [pLeafL, ibLimb, Wd.limb, 5, 6, 0, 'tree'],
-    [pLeafS, ibSmall, Wd.small, 2.5, 6, 0, SMALL_F],
-    [pLeafS, ibSmallF, Wd.smallF, 2.5, 6, SMALL_F, SMALL_L],
-    [pLeafS, ibSmallL, Wd.smallL, 2.5, 6, SMALL_L, 'plant'],
+    [pLeafL, ibLimb, Wd.limb, REACH, 6, 0, 'limb', visNear],
+    [pLeafS, ibSmall, Wd.small, 2.5, 6, 0, 'smallF'],
+    [pLeafS, ibSmallF, Wd.smallF, 2.5, 6, 'smallF', 'smallL'],
+    [pLeafS, ibSmallL, Wd.smallL, 2.5, 6, 'smallL', 'plant'],
   ];
   const tierAt = (x) => (typeof x === 'string' ? TIER[x] : x);
   // where solids stop being drawn: FOG_END, or where the fog has closed over all of them (mar: their reach)
   const drawEnd = (mar) => min(FOG_END, LOD.close[1] + mar);
   // one level of detail of a cell-sorted set of solids: `mesh` for the cells within [from, to)
-  const tier = (r, set, mesh, mar, from, to) => {
-    if (to > from) drawCells(r, set, mar, mesh, 0, from, to);
+  const tier = (r, set, mesh, mar, from, to, seen) => {
+    if (to > from) drawCells(r, set, mar, mesh, 0, from, to, seen);
   };
   // The far pictures to blend in this frame where the fog closes: those in view from where they begin to come in
   // to where the fog has closed over them (TIER.farEnd), far to near, into vbFar (world.js farT's records: crown
@@ -2408,11 +2993,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     const dist = sqrt(px * px + py * py + pz * pz) - rad;
     return dist > 0 ? dist : 0;
   }
-  // Draws what of a cell-sorted store is in view and within [minD, maxD) of the camera (scaled by `det`, but not for
-  // the ground), as merged runs, nearest rows first. A store with `sub` is cut by sub-cell where a cell straddles
+  // Draws what of a cell-sorted store is in view and within [minD, maxD) of the camera, as merged runs, nearest rows
+  // first. A store with `sub` is cut by sub-cell where a cell straddles
   // either distance; one without (the ground) goes cell by cell, by the cell's nearest point.
   // indexed: 1 for the ground, a mesh for instances of it, false for `verts` vertices per instance.
-  function drawCells(r, set, mar, indexed, verts, minD, maxD) {
+  function drawCells(r, set, mar, indexed, verts, minD, maxD, seen = vis) {
     const start = set.start,
       lo = set.lo,
       hi = set.hi,
@@ -2429,12 +3014,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       ux = F[UX],
       uy = F[UY],
       uz = F[UZ];
-    const ds = indexed === 1 ? 1 : det * det;
     const tx = (TANH * W) / H,
       hw = CELLW * 0.5,
       ex = hw + mar,
-      min2 = minD * minD * ds,
-      max2 = maxD * maxD * ds;
+      min2 = minD * minD,
+      max2 = maxD * maxD;
     for (let k = 0; k < CELLS; k++) {
       const rw = rowOrd[k],
         row = rw * CELLS,
@@ -2450,7 +3034,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           l = lo[c],
           h = hi[c];
         // (debug.isolate shows its tree whatever would hide it)
-        if (l > h || (indexed !== 1 && !vis[c] && !ISO[3])) continue;
+        if (l > h || (indexed !== 1 && !seen[c] && !ISO[3])) continue;
         const px = OX + (x + 0.5) * CELLW - cx,
           hx = max(abs(px) - hw, 0),
           near2 = hx * hx + hz * hz;
@@ -2514,14 +3098,55 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     }
   }
   const SUBW = CELLW / SUBS;
-  // triBy: the frame's triangles so far by what they are (render sets `cat`), for the stats line: the scene is bound
-  // by triangles, so this is what to read before adding geometry. drawN: draw calls
-  const CATS = ['ground', 'rocks+logs', 'trunks', 'leaves', 'plants', 'air'],
-    triBy = new Float64Array(CATS.length); // air: dust, falling leaves, rain
+  // triBy, drawBy: the frame's triangles and draw calls so far by what they are (render sets `cat`), for the stats
+  // line and the budget view: the scene is bound by triangles, so this is what to read before adding geometry.
+  // drawN: all the draw calls
+  const CATS = [
+      'ground',
+      'rocks+logs',
+      'trunks',
+      'leaves',
+      'plants',
+      'air',
+      'water',
+      'animals',
+    ],
+    triBy = new Float64Array(CATS.length), // air: dust, falling leaves, rain, a bolt
+    drawBy = new Float64Array(CATS.length);
+  // The parts of the frame a measure (debug.measure, the budget view's) switches off one at a time; render leaves out
+  // what is on here (the passes' textures keep their last frame)
+  const OFF = {
+    water: false,
+    waterMotion: false,
+    shafts: false,
+    bloom: false,
+    metering: false,
+    post: false,
+    far: false,
+    leaves: false,
+    plants: false,
+    trunks: false,
+    rocks: false,
+    ground: false,
+    animals: false,
+    air: false,
+  };
   let cat = 0,
     birdTris = 0, // (the last frame's, the sticks under them too: debug.birdTris)
     drawN = 0,
+    passN = 0, // (the frame's render passes)
     cpuMs = 0;
+  // a measure's pass without the post: the screen only cleared (to the sky's colour)
+  const passBlank = {
+    colorAttachments: [
+      {
+        view: null,
+        loadOp: 'clear',
+        storeOp: 'store',
+        clearValue: [0.69, 0.6, 0.47, 1],
+      },
+    ],
+  };
   // the frame's triangles for each row of LEAVES (debug.tiers)
   const tierTris = new Float64Array(16);
   // debug.audit: does the culling leave out anything it should draw? While auditing, every store drawn in a frame
@@ -2606,22 +3231,26 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     return [checked, missed];
   };
   function drawRun(r, indexed, verts, from, to) {
-    drawN++;
+    drawBy[cat]++;
     if (auditCur) auditCur.runs.push(from, to);
     triBy[cat] +=
       indexed === 1
         ? (to - from) * 2
         : indexed
           ? (indexed.ib.length / 3) * (to - from)
-          : (verts > 6 ? verts / 3 : verts - 2) * (to - from);
+          : verts === 'quads'
+            ? 4 * (to - from)
+            : (verts > 6 ? verts / 3 : verts - 2) * (to - from);
     if (indexed === 1) r.drawIndexed((to - from) * 6, 1, from * 6, 0, nSolid);
     else if (indexed)
       r.drawIndexed(indexed.ib.length, to - from, indexed.i0, indexed.v0, from);
+    else if (verts === 'quads') r.drawIndexed(12, to - from, 0, 0, from);
     else r.draw(verts, to - from, 0, from);
   }
   function render() {
     triBy.fill(0);
-    cat = drawN = 0;
+    drawBy.fill(0);
+    cat = 0;
     if (auditing) auditSets.clear();
     sight();
     // camera basis (right vector is horizontal)
@@ -2683,8 +3312,9 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     m[45] = fy;
     m[46] = fz;
     m[47] = NEAR;
-    // The weather (struct G): sun.w how overcast (the clouds come before the rain), mis exposure (the eye opens up
-    // under cloud, but a storm stays dark), shafts, draw distance, debug.sprigs; wx wetness, wind, rain falling, haze per metre
+    // The weather (struct G): sun.w how overcast (the clouds come before the rain), mis the old rule's exposure (the
+    // eye opens up under cloud, but a storm stays dark; W_POST stops it down for highlights), shafts, (free),
+    // debug.sprigs; wx wetness, wind, rain falling, haze per metre
     // (thick fog closes the view in at about 30 m)
     const rain = F[RAIN],
       fogK = F[FOGK],
@@ -2699,7 +3329,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           (F[ADAPT] || adaptTo());
     // (a tree shown alone and shaded: no shafts, the opening view's exposure, held)
     m[57] = ISO[3] === 2 ? 0 : RAYS;
-    m[58] = det;
+    m[58] = 0; // (free)
     m[59] = sprigsMode;
     m[60] = F[WET];
     m[61] = windNow();
@@ -2730,13 +3360,17 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     m.set(LOD.close, 86);
     // ex: the highlights' key, 1 for the old exposure rule (debug.exposure); ea: the frame's seconds, 1 to take its
     // measure at once
-    m[88] = HIGH;
-    m[89] = ISO[3] === 2 ? 1 : expoMode;
+    m[88] = HIGHLIGHTS;
+    m[89] = ISO[3] === 2 || OFF.metering ? 1 : expoMode;
     m[90] = isoPart;
     m[92] = frameDt;
     m[93] = meterNew ? 1 : 0;
-    // dbg: debug.isolate
+    // dbg: debug.isolate; kn: the Try knobs
     m.set(ISO, 96);
+    m[100] = kn.l / 100;
+    m[101] = kn.p / 100;
+    m[102] = kn.s;
+    m[103] = LOW ? 0 : kn.w; // (nothing sways at Low: W_LEAF_LOW)
     meterNew = false;
     Q.writeBuffer(ubo, 0, UB);
     WT[0] = F[TIME];
@@ -2762,23 +3396,33 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           break;
         }
     }
-    waterPass[0].timestampWrites = slot ? tsBegin : undefined;
+    // (the first pass encoded takes the begin stamp, the post the end one: what a measure leaves out moves them)
+    let stamp = slot ? tsBegin : undefined;
+    const begin = (desc) => {
+      desc.timestampWrites = stamp;
+      stamp = undefined;
+      return e.beginRenderPass(desc);
+    };
     passPost.timestampWrites = slot ? tsEnd : undefined;
+    passBlank.timestampWrites = slot ? tsEnd : undefined;
+    let r;
     // the animated texture (leaf shadows, ripples) + mips
-    let r = e.beginRenderPass(waterPass[0]);
-    r.setPipeline(pWater);
-    r.setBindGroup(0, bgWater);
-    r.draw(3);
-    r.end();
-    for (let i = 1; i < 5; i++) {
-      r = e.beginRenderPass(waterPass[i]);
-      r.setPipeline(pMip16);
-      r.setBindGroup(0, waterBG[i - 1]);
+    if (!OFF.water && !OFF.waterMotion) {
+      r = begin(waterPass[0]);
+      r.setPipeline(pWater);
+      r.setBindGroup(0, bgWater);
       r.draw(3);
       r.end();
+      for (let i = 1; i < 5; i++) {
+        r = begin(waterPass[i]);
+        r.setPipeline(pMip16);
+        r.setBindGroup(0, waterBG[i - 1]);
+        r.draw(3);
+        r.end();
+      }
     }
     // scene
-    r = e.beginRenderPass(passScene);
+    r = begin(passScene);
     // (debug.isolate: only its tree, on black; the vertex shaders leave out every other card and solid)
     const alone = ISO[3] > 0;
     // the signposts' lettering, the falling leaves, the sky, a bolt, the lake and the streams
@@ -2788,45 +3432,48 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       r.setBindGroup(1, bgSign);
       r.setVertexBuffer(0, vbSign);
       r.draw(4, nSign);
-      drawN++;
+      drawBy[1]++;
       // falling leaves (opaque), the sky behind everything, then the lake's water blended over its bed
-      r.setPipeline(pFall);
-      r.setVertexBuffer(0, ibSnowB);
-      r.draw(4, SPRITES[2]);
-      drawN++;
-      triBy[5] += SPRITES[2] * 2;
+      if (!OFF.air) {
+        r.setPipeline(pFall);
+        r.setVertexBuffer(0, ibSnowB);
+        r.draw(4, SPRITES[2]);
+        drawBy[5]++;
+        triBy[5] += SPRITES[2] * 2;
+      }
       r.setPipeline(pBack);
       r.draw(4);
       // a bolt of lightning, on the sky: behind everything else, and under the rain drawn after it
-      if (FL[3] > 1 && boltN && flick.length && flashAge() < 2.5) {
+      if (FL[3] > 1 && boltN && flick.length && flashAge() < 2.5 && !OFF.air) {
         r.setPipeline(pBolt);
         r.setVertexBuffer(0, vbBolt);
         r.draw(4, boltN);
-        drawN++;
+        drawBy[5]++;
         triBy[5] += boltN * 2;
       }
+      if (OFF.water) return;
       r.setPipeline(pSurf);
       r.draw(4);
       // a soft dark patch on the lake under the boat and round each pile
       r.setPipeline(pBlot);
       r.setVertexBuffer(0, vbWaterBlot);
       r.draw(4, 3 + Wd.boat.piles.length);
-      drawN++;
       // the running water: one mesh for both streams (a few thousand triangles, so it is not culled)
       r.setPipeline(pStream);
       r.setVertexBuffer(0, vbWater);
       r.setIndexBuffer(ibWater, 'uint32');
       r.drawIndexed(nWater);
-      drawN++;
-      triBy[0] += nWater / 3;
+      drawBy[6] += 3;
+      triBy[6] += 2 + nWater / 3;
     };
 
     r.setBindGroup(0, bg0);
     // The ground: each far level starts one ring of cells early, under the finer one, which hides the cracks. The
     // last goes on a little past where the fog has taken everything else
     r.setPipeline(pTerrain);
+    if (LOW) r.setBindGroup(1, bgGround);
     r.setVertexBuffer(1, ibSolids);
-    for (let l = 0; l < terr.length; l++) {
+    for (let l = 0; l < (OFF.ground ? 0 : terr.length); l++) {
       const t = terr[l];
       r.setVertexBuffer(0, t.vb);
       r.setIndexBuffer(t.ib, 'uint32');
@@ -2860,11 +3507,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
           Wd.solids.ranges[M_WOOD][0],
         );
         triBy[cat] += to - from;
-        drawN++;
+        drawBy[cat]++;
         if (auditCur) auditCur.runs.push(from, to);
       };
       auditCur = auditing ? auditNote(woodAt, 0, drawEnd(0)) : null;
-      for (let c = 0; c < CELLS * CELLS; c++) {
+      for (let c = 0; c < (OFF.rocks ? 0 : CELLS * CELLS); c++) {
         const a = woodAt[c],
           b = woodAt[c + 1];
         if (a === b || !vis[c]) continue;
@@ -2883,30 +3530,33 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       }
       if (from >= 0) run();
     }
-    // boulders, logs and stumps, to the fog's end whatever the draw distance scale (they are large and do not fade)
-    for (let i = 0; i < 4; i++) {
+    // boulders, logs and stumps, to the fog's end (they are large and do not fade)
+    for (let i = 0; i < (OFF.rocks ? 0 : 4); i++) {
       const c = Wd.boulders[i];
       r.setVertexBuffer(1, ibBoulder[i]);
       tier(r, c, meshes[i], 7, 0, BOULDER[0]);
       tier(r, c, meshes[M_BOULDER_MID + i], 7, BOULDER[0], BOULDER[1]);
-      tier(r, c, meshes[M_BOULDER_FAR + i], 7, BOULDER[1], drawEnd(7) / det);
+      tier(r, c, meshes[M_BOULDER_FAR + i], 7, BOULDER[1], drawEnd(7));
     }
     // trunks, to the fog's end: one mesh at every distance
     cat = 2;
-    for (let i = 0; i < NTRUNK; i++) {
+    const trunks = OFF.trunks ? 0 : NTRUNK;
+    for (let i = 0; i < trunks; i++) {
       const c = Wd.props[i];
       r.setVertexBuffer(1, ibProp[i]);
-      tier(r, c, meshes[M_TRUNK + i], 8, 0, drawEnd(8) / det);
+      tier(r, c, meshes[M_TRUNK + i], 8, 0, drawEnd(8) + REACH, visNear);
     }
-    // the bark's shell on the trunks close by (W_SOLID vsShell)
-    r.setPipeline(pShell);
-    for (let i = 0; i < NTRUNK; i++) {
-      r.setVertexBuffer(1, ibProp[i]);
-      tier(r, Wd.props[i], meshes[M_TRUNK + i], 8, 0, 8);
+    // the bark's shell on the trunks close by (W_SOLID vsShell; none at Low)
+    if (!LOW) {
+      r.setPipeline(pShell);
+      for (let i = 0; i < trunks; i++) {
+        r.setVertexBuffer(1, ibProp[i]);
+        tier(r, Wd.props[i], meshes[M_TRUNK + i], 8, 0, 8);
+      }
     }
     r.setPipeline(pSolid);
     cat = 1;
-    for (let i = 0; i < NCHUNK; i++) {
+    for (let i = 0; i < (OFF.rocks ? 0 : NCHUNK); i++) {
       const c = Wd.chunks[i];
       r.setVertexBuffer(1, ibChunk[i]);
       if (i > 7) {
@@ -2938,9 +3588,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       tier(r, c, meshes[M_CHUNK_MID + i - 3], 3, CHUNK[1], CHUNK[2]);
       tier(r, c, meshes[M_TINY + i], 3, CHUNK[2], drawEnd(3));
     }
-    // the animals: under a hundred instances, so every group is drawn
-    {
-      // the boat by the pier, then its lid into the depth only
+    // the boat by the pier, then its lid into the depth only
+    if (!OFF.rocks) {
       const hull = meshes[M_BOAT],
         lid = meshes[M_BOAT + 1];
       r.setPipeline(pSolid);
@@ -2949,97 +3598,85 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       r.setPipeline(pLid);
       r.drawIndexed(lid.ib.length, 1, lid.i0, lid.v0, 0);
       r.setPipeline(pSolid);
-      drawN += 2;
+      drawBy[1] += 2;
       triBy[1] += hull.ib.length / 3;
     }
-    r.setVertexBuffer(1, ibCreature);
-    for (let i = 0; i < critters.groups.length; i++) {
-      const g = critters.groups[i],
-        t = meshes[g.mesh];
-      r.drawIndexed(t.ib.length, g.count, t.i0, t.v0, g.first);
-    }
-    // deer (deer.js): what is awake of them, part by part
+    // deer (deer.js): what is awake of them, part by part, on the solid pipeline set above
+    const animals = !OFF.animals;
     r.setVertexBuffer(1, ibDeer);
-    for (const g of deer.groups) {
+    for (const g of animals ? deer.groups : []) {
       if (!g.count) continue;
       const t = meshes[g.mesh];
       r.drawIndexed(t.ib.length, g.count, t.i0, t.v0, g.first);
-      triBy[5] += (t.ib.length / 3) * g.count;
-      drawN++;
+      triBy[7] += (t.ib.length / 3) * g.count;
+      drawBy[7]++;
     }
-    if (ANIMALS) {
-      r.setPipeline(pManta);
-      r.setVertexBuffer(1, ibBirds);
-      r.drawIndexed(BIRD.ib.length, nBird, BIRD.i0, BIRD.v0, 0);
-    }
-    // flocks: each one that is in view, without the fine parts when far (butterflies sooner: they are tiny)
-    r.setPipeline(pFish);
-    r.setVertexBuffer(1, ibFish);
-    for (let i = 0; ANIMALS && i < Wd.schools.length; i++) {
-      const sc = Wd.schools[i],
-        d = seen(sc.x, sc.y, sc.z, sc.r + 5);
-      if (d < 0 || d > 150) continue;
-      const t =
-        meshes[
-          (d < FLY_NEAR * (sc.kind ? 1 : 0.4) ? M_FLY : M_FLY_FAR) + sc.kind
-        ];
-      r.drawIndexed(t.ib.length, sc.count, t.i0, t.v0, sc.first);
-    }
-    // the birds, mesh by mesh (birds.js counts): the songbird's near and far, the jay's, the raven's (the crow
-    // family's on vsJay); then the sticks under those that sit on a dead branch, after them in the same buffer
+    // the birds, mesh by mesh (birds.js counts): the jay's near and far, the raven's, all on vsJay; then the
+    // sticks under those that sit on a dead branch, after them in the same buffer
     let nBirds = 0;
     birdTris = 0;
-    for (let slot = 0; slot < 6; slot++) nBirds += birds.counts[slot];
-    if (nBirds && !alone) {
+    for (let slot = 0; slot < 4; slot++) nBirds += birds.counts[slot];
+    if (nBirds && !alone && animals) {
       r.setVertexBuffer(1, ibBird);
-      for (let slot = 0, first = 0; slot < 6; first += birds.counts[slot++]) {
-        const mesh = meshes[M_SONG + slot],
+      r.setPipeline(pJay);
+      for (let slot = 0, first = 0; slot < 4; first += birds.counts[slot++]) {
+        const mesh = meshes[M_JAY + slot],
           count = birds.counts[slot];
         if (!count) continue;
-        r.setPipeline(slot > 1 ? pJay : pBird);
         r.drawIndexed(mesh.ib.length, count, mesh.i0, mesh.v0, first);
-        drawN++;
-        triBy[5] += (mesh.ib.length / 3) * count;
+        drawBy[7]++;
+        triBy[7] += (mesh.ib.length / 3) * count;
         birdTris += (mesh.ib.length / 3) * count;
       }
-      if (birds.counts[7]) {
-        const stick = meshes[M_SONG + 6];
-        r.setPipeline(pJay);
+      if (birds.counts[5]) {
+        const stick = meshes[M_JAY + 4];
         r.drawIndexed(
           stick.ib.length,
-          birds.counts[7],
+          birds.counts[5],
           stick.i0,
           stick.v0,
           nBirds,
         );
-        drawN++;
-        birdTris += (stick.ib.length / 3) * birds.counts[7];
+        drawBy[7]++;
+        birdTris += (stick.ib.length / 3) * birds.counts[5];
       }
     }
     // leaves: fewer rows per blade with distance, then thinned-out sets
     for (let i = 0; i < LEAVES.length; i++) {
       const t = LEAVES[i];
       tierTris[i] = 0;
+      cat = t[0] === pLeafS || t[0] === pLeafMS || t[1] === ibShrub ? 4 : 3;
+      if (cat === 3 ? OFF.leaves : OFF.plants || !kn.p) continue;
       r.setPipeline(t[0]);
       r.setVertexBuffer(0, t[1]);
-      cat = t[0] === pLeafS || t[0] === pLeafMS || t[1] === ibShrub ? 4 : 3;
-      const before = triBy[cat];
-      drawCells(r, t[2], t[3], false, t[4], tierAt(t[5]), tierAt(t[6]));
+      // (Low: a card is its two quads, drawn indexed, with its light record)
+      const quads = LOW && (t[4] === 'near' || t[4] === 12);
+      if (LOW) r.setVertexBuffer(1, lightOf.get(t[1]));
+      if (quads) r.setIndexBuffer(ibQuads, 'uint16');
+      const before = triBy[cat],
+        verts = quads
+          ? 'quads'
+          : t[4] === 'near'
+            ? kn.n
+              ? SPRIGS * 6
+              : 12
+            : t[4];
+      drawCells(r, t[2], t[3], false, verts, tierAt(t[5]), tierAt(t[6]), t[7]);
       tierTris[i] = triBy[cat] - before;
     }
     // a dark blot under each bird on the ground
-    if (birds.counts[6] && !alone) {
+    if (birds.counts[4] && !alone && animals) {
       r.setPipeline(pBlot);
       r.setVertexBuffer(0, vbBlot);
-      r.draw(4, birds.counts[6]);
-      drawN++;
+      r.draw(4, birds.counts[4]);
+      drawBy[7]++;
     }
     // (deer's blots: three under each)
-    if (deer.groups[0].count && !alone) {
+    if (deer.groups[0].count && !alone && animals) {
       r.setPipeline(pBlot);
       r.setVertexBuffer(0, vbDeerBlot);
       r.draw(4, deer.groups[0].count * 3);
-      drawN++;
+      drawBy[7]++;
     }
     // (none of it with a tree alone, but the sky shaded: fsB)
     if (!alone) backdrop();
@@ -3050,91 +3687,114 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     // the far trees' pictures, blended over everything opaque and the water (which writes no depth: a tree before
     // it must come after it), far to near
     // (none where the fog has closed before they begin to come in)
-    farN = LOD.close[1] > LOD.far[0] ? farSorted() : 0;
+    farN = LOD.close[1] > LOD.far[0] && !OFF.far ? farSorted() : 0;
     if (farN) {
       r.setPipeline(pLeafFB);
       r.setVertexBuffer(0, vbFar);
       r.draw(4, farN);
-      drawN++;
+      drawBy[3]++;
       triBy[3] += farN * 2;
     }
-    // lights added on top: fireflies, dust in the sun, rain
-    if (ANIMALS && !alone) {
-      r.setPipeline(pGl);
-      r.setVertexBuffer(0, ibGl);
-      drawCells(r, Wd.glints, 2, false, 4, 0, GLINT_END);
-    }
+    // lights added on top: dust in the sun, rain
     r.setVertexBuffer(0, ibSnowB);
-    if (rain < 0.25 && fogK < 0.99 && !alone) {
+    const air = !alone && !OFF.air;
+    if (rain < 0.25 && fogK < 0.99 && air) {
       r.setPipeline(pSnow);
       r.draw(4, SPRITES[0]);
-      drawN++;
+      drawBy[5]++;
       triBy[5] += SPRITES[0] * 2;
     }
     // the rain: its sheets of streaks further off, the drops near the walker, the drips under the crowns (these
     // for as long as the leaves are wet)
-    if (rain > 0.01 && !alone) {
+    if (rain > 0.01 && air) {
       r.setPipeline(pVeil);
       r.draw(42, 2);
       r.setPipeline(pRain);
       r.draw(4, SPRITES[1]);
-      drawN += 2;
+      drawBy[5] += 2;
       triBy[5] += 80 + SPRITES[1] * 2;
     }
-    if ((rain > 0.01 || F[WET] > 0.05) && !alone) {
+    if ((rain > 0.01 || F[WET] > 0.05) && air) {
       r.setPipeline(pDrip);
       r.draw(4, SPRITES[3]);
-      drawN++;
+      drawBy[5]++;
       triBy[5] += SPRITES[3] * 2;
     }
     r.end();
+    drawN = drawBy.reduce((sum, n) => sum + n, 0);
+    passN = 1;
     // light shafts
-    r = e.beginRenderPass(passRays);
-    r.setPipeline(pRays);
-    r.setBindGroup(0, bgRays);
-    r.draw(3);
-    r.end();
-    r = e.beginRenderPass(passBlur);
-    r.setPipeline(pRB);
-    r.setBindGroup(0, bgBlur);
-    r.draw(3);
-    r.end();
+    if (!OFF.shafts) {
+      r = begin(passRays);
+      r.setPipeline(pRays);
+      r.setBindGroup(0, bgRays);
+      r.draw(3);
+      r.end();
+      r = begin(passBlur);
+      r.setPipeline(pRB);
+      r.setBindGroup(0, bgBlur);
+      r.draw(3);
+      r.end();
+      passN += 2;
+    } else {
+      begin(passBlur).end(); // (cleared: the post adds none)
+      passN++;
+    }
     // the eye's measure of the frame, before its exposure and its bloom: into the adapted value the post reads
-    meterAt ^= 1;
-    r = e.beginRenderPass(passGrid);
-    r.setPipeline(pGrid);
-    r.setBindGroup(0, bgGrid);
-    r.draw(3);
-    r.end();
-    r = e.beginRenderPass(passAdapt[meterAt]);
-    r.setPipeline(pAdapt);
-    r.setBindGroup(0, bgAdapt[meterAt]);
-    r.draw(3);
-    r.end();
+    if (!OFF.metering) {
+      meterAt ^= 1;
+      r = begin(passGrid);
+      r.setPipeline(pGrid);
+      r.setBindGroup(0, bgGrid);
+      r.draw(3);
+      r.end();
+      r = begin(passAdapt[meterAt]);
+      r.setPipeline(pAdapt);
+      r.setBindGroup(0, bgAdapt[meterAt]);
+      r.draw(3);
+      r.end();
+      passN += 2;
+    }
     // bloom
-    for (let i = 0; i < bloomPass.length; i++) {
-      r = e.beginRenderPass(bloomPass[i]);
+    if (OFF.bloom) {
+      begin(bloomPass[0]).end(); // (cleared: the post adds none)
+      passN++;
+    }
+    for (let i = 0; i < (OFF.bloom ? 0 : bloomPass.length); i++) {
+      r = begin(bloomPass[i]);
       r.setPipeline(i === 0 ? pDown0 : i < NB ? pDown : pUp);
       r.setBindGroup(0, bloomBG[i]);
       r.draw(3);
       r.end();
+      passN++;
     }
-    // composite
-    passPost.colorAttachments[0].view = ctx.getCurrentTexture().createView();
-    r = e.beginRenderPass(passPost);
-    r.setPipeline(pPost);
-    r.setBindGroup(0, bgPost[meterAt]);
-    r.draw(3);
-    r.end();
+    // composite (a measure without it: only the screen cleared)
+    const screen = ctx.getCurrentTexture().createView();
+    if (OFF.post) {
+      passBlank.colorAttachments[0].view = screen;
+      e.beginRenderPass(passBlank).end();
+    } else {
+      passPost.colorAttachments[0].view = screen;
+      r = e.beginRenderPass(passPost);
+      r.setPipeline(pPost);
+      r.setBindGroup(0, bgPost[meterAt]);
+      r.draw(3);
+      r.end();
+    }
+    passN += OFF.water ? 1 : 6;
     if (slot) {
       e.resolveQuerySet(qs, 0, 2, qResolve, 0);
       e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16);
     }
     submitList[0] = e.finish();
+    submittedAt = performance.now();
     Q.submit(submitList);
     if (slot) {
       slot.busy = true;
-      slot.b.mapAsync(GPUMapMode.READ).then(slot.done);
+      gpuRead = slot.b.mapAsync(GPUMapMode.READ).then(slot.done);
+    } else if (!hasTS) {
+      const t0 = performance.now();
+      Q.onSubmittedWorkDone().then(() => gpuTook(performance.now() - t0));
     }
   }
 
@@ -3646,24 +4306,240 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     F[CZ] = P2[1];
   }
 
-  // At most 60 frames a second: a 90 or 120 Hz phone screen would double the GPU work and heat for little gain.
-  // pace carries the time over since the last drawn frame, so 90 Hz draws two frames in three, not one in two.
-  const PACE = 1000 / 60;
-  let pace = 0,
-    paceAt = 0;
+  // A steady TARGET frames a second: a frame on every n-th refresh of the screen (every: n by its measured rate, 2 at
+  // 60 Hz, 3 at 90, 4 at 120), never a mix of rates; all motion goes by time. refreshMs: the median of the last
+  // REFRESHES intervals between the browser's frames, drawn or not (debug.target sets another TARGET). 30 fps is the
+  // budget every tuning here was made to: the render-size tuner (frame) and the tier's judging work to slotMs
+  const REFRESHES = 31,
+    gaps = new Float32Array(REFRESHES);
+  let TARGET = 30,
+    gapN = 0,
+    refreshAt = 0,
+    refreshMs = 1000 / 60,
+    every = 2,
+    drawnAt = 0;
+  const slotMs = () => every * refreshMs; // a drawn frame's time
+  const pacing = () => {
+    every = max(1, round(1000 / refreshMs / TARGET));
+  };
   // a throw in a frame would repeat every frame over a frozen picture: it ends the scene and is shown instead
   function frame(now) {
     raf = requestAnimationFrame(frame);
-    pace += now - paceAt;
-    paceAt = now;
-    if (pace < PACE - 2) return;
-    pace = min(pace - PACE, PACE);
+    const gap = now - refreshAt;
+    refreshAt = now;
+    if (gap > 0 && gap < 100) {
+      gaps[gapN++ % REFRESHES] = gap;
+      if (gapN % 8 === 0) {
+        refreshMs = median(gaps.subarray(0, min(gapN, REFRESHES)));
+        pacing();
+      }
+    }
+    // (half a refresh early at most: the browser's frame times wobble round each refresh; none while a measure
+    // draws its own)
+    if (meas || now - drawnAt < (every - 0.5) * refreshMs) return;
+    drawnAt = now;
     try {
       step(now);
     } catch (e) {
       stop('The scene stopped: ' + e.message, false, e);
     }
   }
+  // ---------------------------------------------------------------- the budget (the on-screen view, main.ts)
+  // The last RING frames (step fills them): budget() reads what the view shows over its last 2 s
+  const RING = 256,
+    ringT = new Float64Array(RING),
+    ringDt = new Float32Array(RING),
+    ringCpu = new Float32Array(RING),
+    ringGpu = new Float32Array(RING);
+  let ringAt = 0;
+  function budget() {
+    const now = performance.now();
+    let n = 0,
+      dt = 0,
+      worst = 0,
+      cpu = 0,
+      gpu = 0;
+    for (let i = 1; i <= min(ringAt, RING); i++) {
+      const k = (ringAt - i) % RING;
+      if (now - ringT[k] > 2000) break;
+      n++;
+      dt += ringDt[k];
+      worst = max(worst, ringDt[k]);
+      cpu += ringCpu[k];
+      gpu += ringGpu[k];
+    }
+    return {
+      level: LEVEL,
+      why: WHY,
+      frames: n,
+      frameMs: n ? dt / n : 0,
+      worstMs: worst,
+      cpuMs: n ? cpu / n : 0,
+      gpuMs: n ? gpu / n : -1,
+      gpuBy: hasTS ? 'timer' : 'submit to done',
+      target: TARGET,
+      hz: 1000 / refreshMs,
+      every,
+      decided,
+      det,
+      pixMin,
+      atFloor,
+      tryCode: knobCode(),
+      size: [W, H, DW, DH],
+      groups: CATS.map((name, k) => [name, triBy[k], drawBy[k]]),
+      draws: drawN,
+      passes: passN,
+      cells: [visN, CELLS * CELLS],
+      gpu: facts.gpu,
+      heapMB: (performance.memory?.usedJSHeapSize ?? -1048576) / 1048576,
+      gpuMB: [gpuMem.buffers / 1048576, gpuMem.textures / 1048576],
+      bake: bakeTimes(true),
+      pipelines: facts.pipelines || '',
+    };
+  }
+  // A measure (budget view's Measure), one frame at a time: each drawn alone and waited for, its time from the
+  // submit to the GPU's done (wall) and by the GPU's timer where the device has one. Everything on (A) is measured
+  // between every part left out (A, part, A, part, ... A), each stretch WARM frames then TAKE, its median; a part's
+  // saving is the mean of the A on either side less its own, and the A's spread is the noise. Meanwhile the paced
+  // drawing, the tuner (the render size held), the walker and the clock stand still
+  const WARM = 2,
+    TAKE = 6,
+    half = { apply: () => setPix(heldPix / 2), undo: () => setPix(heldPix) },
+    // (a Try knob held at a value through its stretch)
+    knobAt = (key, value) => {
+      let was;
+      return {
+        apply: () => {
+          was = kn[key];
+          setKnob(key, value, false);
+        },
+        undo: () => setKnob(key, was, false),
+      };
+    },
+    PARTS = [
+      ['water', 'water'],
+      ['light shafts', 'shafts'],
+      ['bloom', 'bloom'],
+      ['exposure metering', 'metering'],
+      ['post pass', 'post'],
+      ['far tree pictures', 'far'],
+      ['leaves', 'leaves'],
+      ['plants', 'plants'],
+      ['trunks', 'trunks'],
+      ['rocks and logs', 'rocks'],
+      ['ground', 'ground'],
+      ['animals', 'animals'],
+      ['rain, dust, leaves', 'air'],
+      ['sound', { apply: () => soundPause(), undo: () => soundResume() }],
+      ['half render size', half],
+      ['draw distance 50%', knobAt('d', 50)],
+      ['pictures from 15 m', knobAt('f', 15)],
+    ];
+  let meas = null,
+    heldPix = 0,
+    submittedAt = 0, // (render: when its frame went to the GPU, and the GPU timer's reading on its way)
+    gpuRead = null;
+  const setPix = (n) => {
+    pix = n;
+    resize();
+  };
+  // (a part: a switch of OFF, set back to what it was, or its own way to leave itself out (apply) and back (undo))
+  const partOff = (part, off, was) => {
+    if (typeof part === 'string') OFF[part] = off || was;
+    else if (off) part.apply();
+    else part.undo();
+  };
+  const median = (list) => {
+    const a = [...list].sort((x, y) => x - y);
+    return a.length ? a[a.length >> 1] : 0;
+  };
+  // one frame drawn and waited for: its wall and GPU times (ms) and this thread's
+  async function oneFrame() {
+    const t0 = performance.now();
+    gpuRead = null;
+    step(t0);
+    const cpu = performance.now() - t0;
+    await Q.onSubmittedWorkDone();
+    const wall = performance.now() - submittedAt;
+    await gpuRead;
+    return { wall, gpu: hasTS ? F[GPU] : NaN, cpu };
+  }
+  async function measure(progress) {
+    if (meas) throw new Error('a measure is running');
+    meas = true;
+    const wasHeld = pixHeld,
+      wasClock = clockHeld,
+      order = [
+        ...PARTS.flatMap((part) => [['all on', null], part]),
+        ['all on', null],
+      ],
+      results = [];
+    heldPix = W * H;
+    pixHeld = true;
+    pix = heldPix;
+    clockHeld = true;
+    try {
+      for (let k = 0; k < order.length; k++) {
+        const [name, part] = order[k],
+          was = typeof part === 'string' ? OFF[part] : false;
+        if (part) partOff(part, true);
+        const got = { name, part, wall: [], gpu: [], cpu: [] };
+        for (let i = 0; i < WARM + TAKE; i++) {
+          progress(k, order.length, name, i);
+          const f = await oneFrame();
+          if (i < WARM) continue;
+          got.wall.push(f.wall);
+          got.gpu.push(f.gpu);
+          got.cpu.push(f.cpu);
+        }
+        if (part) partOff(part, false, was);
+        results.push(got);
+      }
+    } finally {
+      meas = null;
+      pixHeld = wasHeld;
+      clockHeld = wasClock;
+      if (!pixHeld) dynN = dynT = dynC = 0;
+    }
+    return table(results);
+  }
+  // the table: each part's medians (wall, GPU timer: NaN where the device has none) and what leaving it out saved
+  // against the A on either side, most saved first (by the wall time); the noise: the A's spread (max less min)
+  const table = (results) => {
+    const at = (r) => ({
+        wall: median(r.wall),
+        gpu: hasTS ? median(r.gpu) : NaN,
+        cpu: median(r.cpu),
+      }),
+      on = results.filter((r) => !r.part).map(at),
+      spread = (key) =>
+        max(...on.map((a) => a[key])) - min(...on.map((a) => a[key])),
+      mean = (key) => on.reduce((sum, a) => sum + a[key], 0) / on.length,
+      base = { wall: mean('wall'), gpu: mean('gpu'), cpu: mean('cpu') },
+      noise = { wall: spread('wall'), gpu: hasTS ? spread('gpu') : NaN },
+      rows = results
+        .map((r, k) => [r, k])
+        .filter(([r]) => r.part)
+        .map(([r, k]) => {
+          const it = at(r),
+            before = at(results[k - 1]),
+            after = at(results[k + 1]),
+            savedMs = (before.wall + after.wall) / 2 - it.wall,
+            gpuSavedMs = (before.gpu + after.gpu) / 2 - it.gpu;
+          return {
+            part: r.name,
+            frames: r.wall.length,
+            wallMs: it.wall,
+            gpuMs: it.gpu,
+            savedMs,
+            gpuSavedMs,
+            inNoise: Math.abs(savedMs) < noise.wall,
+            gpuInNoise: !(Math.abs(gpuSavedMs) >= noise.gpu),
+          };
+        })
+        .sort((a, b) => b.savedMs - a.savedMs);
+    return { base, noise, rows, byGpu: hasTS };
+  };
   // stats(): the frame rate and worst frame since the last call, for the stats line (main.ts)
   let stN = 0,
     stWorst = 0,
@@ -3687,49 +4563,62 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     let dt = dtr / 1000;
     if (dt > 0.1) dt = 0.1;
     frameDt = dt;
-    // Dynamic resolution for 60 fps: every second (0.4 s for the first few, to settle fast) scale the load by k
-    // (held while debug.isolate shows a tree alone, or debug.pixels holds a size: frames to compare)
+    // Dynamic resolution for the frame's time (slotMs: 33.3 ms at 30 fps): every second (0.4 s for the first few, to
+    // settle fast) scale the load by k (held while debug.isolate shows a tree alone, or debug.pixels holds a size:
+    // frames to compare)
     if (
       !ISO[3] &&
       !pixHeld &&
       dtr < 1e3 &&
       (dynT += dtr) > 0 &&
-      (dynN++, dynT > (tunes < 6 ? 400 : 1000))
+      (dynN++, (dynC += cpuMs), dynT > (tunes < 6 ? 400 : 1000))
     ) {
       tunes++;
-      // (SLOW, dev: every frame taken as 20 ms longer, to try the demotion)
-      const late = SLOW ? 20 : 0,
+      // (SLOW, dev: every frame taken as 60% of a frame's time longer, to try the demotion)
+      const slot = slotMs(),
+        late = SLOW ? 0.6 * slot : 0,
         a = dynT / dynN + late,
-        g = dynGN ? dynG / dynGN + late : 0;
+        g = dynGN ? dynG / dynGN + late : 0,
+        top = min(PIXMAX, DW * DH);
       if (judged < JUDGE) {
         const span = dynT / 1000,
-          over = g ? g > 13.6 : a > 17.6;
+          over = g ? g > 0.816 * slot : a > 1.056 * slot,
+          room = g && g < slot / 2 && dynC / dynN < slot / 2,
+          down = HIGH ? 'Medium' : 'Low';
         judged += span;
         smallFor = W * H < SLOW_SIZE * min(PIX0, DW * DH) ? smallFor + span : 0;
-        starvedFor = over && pix <= PIXMIN ? starvedFor + span : 0;
+        starvedFor = over && pix <= pixMin ? starvedFor + span : 0;
+        roomFor = PROMOTABLE && pix >= top && room ? roomFor + span : 0;
         if (smallFor >= SLOW_FOR || starvedFor >= SLOW_FOR) {
-          demote('slow');
+          demote('slow', down);
           judged = JUDGE;
-        }
+          decided = `demoted: too slow here, ${down} from the next start`;
+        } else if (roomFor >= ROOM_FOR) {
+          promote();
+          judged = JUDGE;
+          decided = 'promoted: Medium had room, High from the next start';
+        } else if (judged >= JUDGE) decided = `judged: ${LEVEL} kept`;
+        else
+          decided = `judging ${LEVEL}: ${judged.toFixed(0)} of ${JUDGE} s${PROMOTABLE ? `, room ${roomFor.toFixed(0)} of ${ROOM_FOR} s` : ''}`;
       }
       let k = 1;
-      // with GPU timing: keep it between 9.8 and 13.6 ms
+      // with the GPU's time: keep it between 59 and 82% of a frame's time (19.6 to 27.2 ms of 33.3 at 30 fps)
       if (g) {
-        if (g > 13.6 || g < 9.8) k = 11.7 / g;
+        if (g > 0.816 * slot || g < 0.588 * slot) k = (0.702 * slot) / g;
       }
       // without: slow for two periods in a row means fewer pixels, and twice as long before trying to go back up
-      else if (a > 17.6) {
+      else if (a > 1.056 * slot) {
         dynOk = 0;
         if (++dynBad > 1) {
-          k = 15 / a;
+          k = (0.9 * slot) / a;
           dynBad = 0;
           dynWait = min(dynWait * 2, 60);
         }
       }
-      // at the display's rate there is no telling if there is room, so try a little more now and then
+      // at the frame's own rate there is no telling if there is room, so try a little more now and then
       else {
         dynBad = 0;
-        if (a < 12.5) k = 15 / a;
+        if (a < 0.75 * slot) k = (0.9 * slot) / a;
         else if (++dynOk > dynWait) {
           k = 1.17;
           dynOk = 0;
@@ -3739,16 +4628,16 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       // visibly changes sharpness. Only the pixels are tuned: the fog ends the view, the draw distances stay put
       const lim = tunes > 6 ? 0.07 : 0.5;
       k = k < 1 - lim ? 1 - lim : k > 1 + lim * 1.4 ? 1 + lim * 1.4 : k;
-      const top = min(PIXMAX, DW * DH),
-        was = pix + det;
+      const was = pix + det;
       {
-        const end = k < 1 ? PIXMIN : top;
+        const end = k < 1 ? pixMin : top;
         pix *= k;
         if (k < 1 ? pix < end : pix > end) pix = end;
+        atFloor = pix <= pixMin;
       }
       if (!dev && was !== pix + det)
-        keep('forestSize', [LEVEL, pix < top ? pix | 0 : '']); // nothing kept at full resolution
-      dynN = dynT = dynG = dynGN = 0;
+        keep('forestTierSize', [LEVEL, pix < top ? pix | 0 : '']); // nothing kept at full resolution
+      dynN = dynT = dynG = dynGN = dynC = 0;
       resize();
     }
     if (!clockHeld) F[TIME] += dt;
@@ -3756,8 +4645,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       // drag to look: screen pixels in radians (a short side's drag turns ~140°), through two cascaded low-pass stages
       const kq = 1 - exp(-dt * 30),
         ls = 2.42 / min(innerWidth, innerHeight);
-      lkx += input.lookX * ls;
-      lky += input.lookY * ls;
+      lkx += meas ? 0 : input.lookX * ls;
+      lky += meas ? 0 : input.lookY * ls;
       input.lookX = input.lookY = 0;
       const ax = lkx * kq,
         ay = lky * kq;
@@ -3769,13 +4658,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         dpt = l2y * kq;
       l2x -= dyw;
       l2y -= dpt;
-      const yaw = F[YAW] + dyw + input.turn * 1.6 * dt; // (a key turns the view a quarter turn a second)
+      const yaw = F[YAW] + dyw + (meas ? 0 : input.turn) * 1.6 * dt; // (a key turns the view a quarter turn a second)
       let pitch = F[PIT] - dpt;
       pitch = pitch < -1.3 ? -1.3 : pitch > 1.3 ? 1.3 : pitch;
       // The walk, eased in and out: forward the way the walker faces while the button is held. A keyboard (keys.ts)
       // also walks back and steps sideways, a diagonal no faster than straight on, and doubles the pace
-      const fwd = input.walk ? 1 : input.forward,
-        side = input.strafe,
+      // (held still while a measure runs)
+      const fwd = meas ? 0 : input.walk ? 1 : input.forward,
+        side = meas ? 0 : input.strafe,
         going = hypot(fwd, side),
         sp = (3.4 * (input.fast ? 2 : 1)) / max(going, 1),
         k = 1 - exp(-dt * 5);
@@ -3836,7 +4726,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         flash();
         flashDue = F[TIME] + 3 + 5 * Math.random();
       }
-      // the eye adapts to where the walker stands, over a second or so (at once after a jump)
+      // the old rule's part: the eye adapts to where the walker stands, over a second or so (at once after a jump)
       F[ADAPT] = F[ADAPT]
         ? F[ADAPT] + (adaptTo() - F[ADAPT]) * min(dt / 1.2, 1)
         : adaptTo();
@@ -3847,8 +4737,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       );
       F[GRAVEL] = trailD(F[CX], F[CZ]) < 1.3 ? 1 : 0;
     }
-    critters.update(F[TIME], F[CX], F[CZ]);
-    Q.writeBuffer(ibCreature, 0, critters.data);
     {
       // The boat rides the lake: it rises, rolls and pitches by a few slow waves that never fall into step, more
       // in a wind. Its instance: place, turn (small angles), timber, a seed under -50 (painted: W_SOLID)
@@ -3897,6 +4785,14 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     render();
     const cpuNow = performance.now() - cpu0;
     cpuMs += (cpuNow - cpuMs) * 0.05; // a running mean of what a frame costs this thread
+    // the budget view's ring of frames: when, how long since the last, this thread's time, the GPU's
+    {
+      const k = ringAt++ % RING;
+      ringT[k] = now;
+      ringDt[k] = dtr;
+      ringCpu[k] = cpuNow;
+      ringGpu[k] = F[GPU];
+    }
     // sound (audio.js): its idle work posted after the frame, once the forest is shown
     if (SOUND && (shown || (shown = document.body.dataset.state === 'ready')))
       soundFrame(cpuNow);
@@ -3947,8 +4843,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   function resume() {
     if (raf || dead) return;
     raf = requestAnimationFrame((t) => {
-      F[LAST] = paceAt = stAt = t;
-      pace = PACE;
+      F[LAST] = stAt = t;
+      refreshAt = drawnAt = 0; // (the first frame back is drawn)
       raf = requestAnimationFrame(frame);
     });
     soundResume();
@@ -3973,11 +4869,30 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     facts['frame check'] = canPeek ? 'on' : 'off';
   }
 
-  // draw the first frame and wait for the GPU to finish it (pipelines get compiled on first use) before the reveal
+  // the Try knobs kept on this device
+  let keptTry = '';
+  try {
+    keptTry = localStorage.forestTry || '';
+  } catch {
+    // storage is blocked: today's settings
+  }
+  tryCode(keptTry);
+  // draw the first frame and wait for the GPU to finish it before the reveal, so its one-off costs fall in the load
+  // (at the smallest render size, then the size the load starts at)
   view(0);
   await say('Letting the light in…', 1, 400);
+  const startPix = pix;
+  pix = min(pix, pixMin);
+  resize();
+  bakeNow = 'the first frame';
+  bakeFacts();
   render();
   await Q.onSubmittedWorkDone();
+  bakeNow = '';
+  bakeFacts();
+  pix = startPix;
+  resize();
+  memoryFacts();
   // (the load counts as survived after 15 s of frames)
   setTimeout(() => {
     loading = false;
@@ -3988,7 +4903,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
   // debug: for looking around from a debugger. view(i) jumps to one of the six viewpoints, look(x, y, z, tx, ty, tz)
   // to any place and target, stand(x, z, tx, tz) on the ground at a place facing another, weather(name) holds a state
   // of the weather, flash() fires one lightning flash, at() where the walker is, ground(x, z) the height they would
-  // stand on there; creatures is what creatures.js moves.
+  // stand on there.
   const stand = (x, z, tx, tz) =>
     lookAt(x, ground(x, z) + EYE, z, tx, ground(tx, tz) + 1, tz);
   // atlasShot(layer, alpha): a layer of the foliage atlas as a PNG data URL (its colours, or its outlines), to look at
@@ -4026,6 +4941,11 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     pause,
     resume,
     stats,
+    budget,
+    measure,
+    knobs: () => ({ code: knobCode(), values: { ...kn }, choices: KNOBS }),
+    knob: (key, value) => setKnob(key, value),
+    tryCode,
     walker: () => [F[CX], F[CZ]],
     debug: {
       view,
@@ -4090,7 +5010,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
         await b.mapAsync(GPUMapMode.READ);
         const high = new Float32Array(b.getMappedRange())[0];
         b.destroy();
-        return [high, exposureOf(old, high), old, HIGH];
+        return [high, exposureOf(old, high), old, HIGHLIGHTS];
       },
       // (one tree alone, white on black, for measuring how much it covers: W_POST)
       isolate: (x, z, reach, shaded, part) => {
@@ -4130,7 +5050,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
       lod: () => {
         lodNow();
         const m1 = (x) => round(x * 10) / 10,
-          cuts = { ...TIER, smallF: SMALL_F, smallL: SMALL_L };
+          cuts = { ...TIER };
         for (const k in cuts) cuts[k] = m1(cuts[k]);
         return {
           tree: LOD.tree.map(m1),
@@ -4173,7 +5093,18 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
                 (o) => o * 2,
               ).join(''),
         ),
-      menu: () => {}, // (main.ts puts the debug menu's switch here on a dev machine)
+      menu: () => {}, // (main.ts puts the testing menu's switch here once the menu is loaded)
+      off: (part, on) => {
+        if (part in OFF) OFF[part] = Boolean(on);
+        return { ...OFF };
+      },
+      target: (fps) => {
+        if (fps > 0) {
+          TARGET = fps;
+          pacing();
+        }
+        return [TARGET, 1000 / refreshMs, every];
+      },
       clock: (to, hold) => {
         if (to >= 0) {
           if (hold) F[BLOWN] += windNow() * (to - F[TIME]); // (what the wind carries moves on with it)
@@ -4194,7 +5125,6 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
             10,
         ) / 10,
       ],
-      creatures: critters,
       // ---------------------------------------------------------------- deer (deer.js)
       deerCount: (n) => deer.count(n),
       deerStretches: () =>
