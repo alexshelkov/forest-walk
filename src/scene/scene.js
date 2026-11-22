@@ -1602,8 +1602,8 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     // or the moss and needles of the woods
     surface: (x, z) => {
       for (const c of Wd.crossings) {
-        if (c.length < 11) continue;
-        const [x0, z0, x1, z1] = c.slice(6),
+        // (the line walked along: the timber's own for logs and stones, the way across, bank to bank, for planks)
+        const [x0, z0, x1, z1] = c.length >= 11 ? c.slice(6) : c.slice(2),
           len = hypot(x1 - x0, z1 - z0),
           along = ((x - x0) * (x1 - x0) + (z - z0) * (z1 - z0)) / len;
         if (
@@ -4026,6 +4026,7 @@ export async function boot({ canvas, input, facts, say, problem, dev }) {
     pause,
     resume,
     stats,
+    walker: () => [F[CX], F[CZ]],
     debug: {
       view,
       look: lookAt,

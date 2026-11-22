@@ -24,21 +24,23 @@ const CX = 0,
 // (the limiter's own make-up gain, which Web Audio adds by its threshold and ratio, is some 7 dB: VOL is set for it)
 const VOL = 0.46, // the master level: an ambient piece, quiet
   STEP_M = 1.7, // metres a step: the walk's 3.4 m/s at the two steps a second of the recordings
-  STEP_DB = -13.5; // a step's peak against the master's: about -17 dBFS on gravel, slight
+  STEP_DB = -13.5; // a step's peak against the master's (about -26 dBFS on gravel, with TYPE_DB's -9): slight
 // each surface's own loudness (dB): grass and moss give little
 const SURF_DB = [0, -1, -1, -5, -5, 0, 0, 0, 0, 1];
-// the water's emitters: name, level at 2 m, how far it carries (m), how fast it falls off (a line, a point); a
-// stream narrower than BROOK m half width is a brook
+// The water's emitters: name, level on the water (0 m from its centre line), how far it carries (m; fading out over
+// the last 30 percent of that), how fast it falls off: (2 / (2 + metres)) to that power. Running water is a nearby
+// sound, loudest on its bridge: a brook gone 12 m off, a creek 15 m. A stream narrower than BROOK m half width is a
+// brook
 const WATERS = [
-    ['brook', 1.5, 30, 0.75],
-    ['creek', 0.4, 40, 0.75],
+    ['brook', 1.5, 12, 1.5],
+    ['creek', 0.628, 15, 1.4],
     ['falls', 0.55, 50, 1],
     ['lake', 0.6, 30, 0.75],
   ],
   BROOK = 0.9;
-// thunder's level at 1.2 km, and its crack's over it
-const THUNDER = 0.65,
-  CRACK = 1.5;
+// thunder's level 5 km off and beyond, and how much louder it is at a kilometre (eased between)
+const THUNDER = 0.276,
+  NEAR_DB = 6;
 // A ceiling at -6 dBFS: straight up to -9, then bending smoothly toward -6, which nothing passes
 const CEILING = Float32Array.from({ length: 1025 }, (_, i) => {
   const x = i / 512 - 1,
@@ -77,9 +79,13 @@ export const TYPES = [
   'jays',
   'ravens',
 ];
+// each type's own level in the mix (dB; set by ear: the debug menu's offsets are on top of it)
+const TYPE_DB = { steps: -9, wind: -18, brook: -6, creek: -9, falls: -6 },
+  typeGain = (k) => pow(10, (TYPE_DB[k] || 0) / 20);
 // each type's switch and level offset (dB), kept here so they hold before the first touch makes the graph
 const trim = Object.fromEntries(TYPES.map((k) => [k, { on: true, db: 0 }]));
-const trimGain = (k) => (trim[k].on ? pow(10, trim[k].db / 20) : 0);
+const trimGain = (k) =>
+  trim[k].on ? typeGain(k) * pow(10, trim[k].db / 20) : 0;
 
 // the timer's own cost, for the checks: ticks run, their total and longest milliseconds; the limiter's deepest
 // reduction in the last offline render
@@ -205,28 +211,28 @@ function makeMix(ac, probe) {
     return v;
   };
   // Thunder from t0, d km off, from `bearing` (-1 left to 1 right): the roll under a shape drawn anew each time
-  // (sounds.js thunderShape: near, up at once and 20 dB down 2.4 to 2.8 s after; far, a swell from nothing), and
-  // near, a crack over it. Far its top and its bottom go (high sounds die first with distance); it starts where the
-  // flash was and drifts toward the middle; everything else is pushed down under it a while
+  // (sounds.js thunderShape: a swell from nothing, a rolling fall, a tail to silence), the same at every distance in
+  // its shape and its tone (a far one's: its top and its bottom gone); the distance sets only its level (NEAR_DB
+  // louder at a kilometre than at 5 and beyond, eased between) and, at the caller, its delay after the flash. It
+  // starts where the flash was and drifts toward the middle; everything else is pushed down under it a while
   const thunder = (t0, d, bearing) => {
     const TH = bank.thunder;
     if (!TH) return;
-    const far = clamp((d - 1) / 5, 0, 1),
-      shape = thunderShape(far, Math.random),
+    const shape = thunderShape(Math.random),
       secs = (shape.length - 1) / SHAPE_RATE,
-      peak = THUNDER * pow(1.2 / max(d, 0.8), 0.6), // (0 dB at 1.2 km, -8 at 6)
+      peak = THUNDER * pow(10, (NEAR_DB * (1 - smooth01((d - 1) / 4))) / 20),
       pan = N(StereoPannerNode, { pan: bearing }, layer.thunder),
-      // (fitted to the near and the distant recordings' octaves)
-      hp = BQ('highpass', 60 + 15 * d, 0.7, 0, pan),
-      lp = BQ('lowpass', 2400 * pow(1 + d, -0.75), 0.7, 0, hp),
+      // (a far roll's tone, fitted to the distant recording's octaves)
+      hp = BQ('highpass', 135, 0.7, 0, pan),
+      lp = BQ('lowpass', 630, 0.7, 0, hp),
       env = G(0, lp),
-      // (far, played slower: lower, and its bursts drawn out)
+      // (played slower: lower, and its bursts drawn out)
       src = N(
         AudioBufferSourceNode,
         {
           buffer: TH.rumble.ab,
           loop: true,
-          playbackRate: (1 - 0.3 * far) * (0.92 + 0.16 * Math.random()),
+          playbackRate: 0.76 * (0.92 + 0.16 * Math.random()),
         },
         env,
       );
@@ -242,10 +248,6 @@ function makeMix(ac, probe) {
     src.onended = () => {
       for (const n of [env, lp, hp, pan]) n.disconnect();
     };
-    if (d < 3) {
-      const crackLp = BQ('lowpass', 8000 / Math.sqrt(1 + d), 0.7, 0, pan);
-      shot(TH.crack, t0, CRACK * peak * (1 - d / 3), crackLp);
-    }
     quiet = t0 + 20;
     // (the rest pushed down under it: the rain 3 dB, the others 6, over 0.15 s; back over 2 s)
     for (const k of TYPES) {
@@ -857,8 +859,9 @@ export const soundDebug = {
       m = (finishBank(), makeMix(ac, probe)),
       only = solo ? solo.split(',') : TYPES;
     m.out.gain.value = VOL;
-    // (the mix as made: the debug levels left out)
-    for (const k of TYPES) m.layer[k].gain.value = only.includes(k) ? 1 : 0;
+    // (the mix as made: the debug offsets left out)
+    for (const k of TYPES)
+      m.layer[k].gain.value = only.includes(k) ? typeGain(k) : 0;
     // the timer's ticks, every 0.1 s of the clip, the walker moving on at v
     for (let k = 1; k < secs * 10 - 1e-6; k++) {
       const t = k / 10;

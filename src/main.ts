@@ -2,6 +2,7 @@
 // The world is built on the first visible, not while the feed preloads: the build takes seconds and
 // hundreds of MB, which would stall the tik the user is looking at.
 import { attachControls } from './controls';
+import { attachReveal, decodeSheet, type Reveal } from './loader';
 import type { Keys } from './keys';
 import { chooseLevel, DEV } from './scene/quality.js';
 import type { Scene, SceneInput } from './scene/scene.js';
@@ -12,6 +13,36 @@ const status = document.getElementById('status')!;
 const details = document.getElementById('details')!;
 const stats = document.getElementById('stats')!;
 const walkButton = document.getElementById('walk')!;
+// The loader's one sprite sheet (loader.ts): the logo shows once it is decoded (never half drawn), and start()
+// waits a little for it before the build takes the thread, so the logo and the painting's silhouettes are on
+// screen from the loader's first moments. 'sheet decode': from asking for it to it decoded
+const logo = document.getElementById('logo')!;
+const showLogo = (): void => logo.classList.add('shown');
+performance.mark('sheet decode');
+const sheetDecoded = decodeSheet().then(() => {
+  performance.measure('sheet decode', 'sheet decode');
+  showLogo();
+});
+const FIRST_PAINT_MS = 150; // the longest the load waits for it
+// Dev only: localStorage.forestArt = '0' leaves the loading screen's painting out (to time the load without it; the
+// logo still shows, from the same sheet)
+function artOff(): boolean {
+  try {
+    return DEV && localStorage.getItem('forestArt') === '0';
+  } catch {
+    return false;
+  }
+}
+const art = document.getElementById('art')!;
+if (artOff()) art.remove();
+const reveal: Reveal = artOff()
+  ? {
+      begin: () => {},
+      last: () => {},
+      done: () => {},
+      show: () => {},
+    }
+  : attachReveal(art);
 
 const input: SceneInput = {
   walk: false,
@@ -39,12 +70,16 @@ const MAX_PROBLEMS = 8;
 const STOPPED = new Error('stopped');
 const STATS_EVERY_MS = 500;
 const SETTLE_MS = 2500;
+const LEAVE_M = 12;
+const LEAVE_CHECK_MS = 500;
 
 let scene: Scene | null = null;
 let booted = false;
 let loaded = 0;
 let statsOn = false;
 let statsTimer = 0;
+let walkFrom: number[] | null = null;
+let leaveTimer = 0;
 let keys: Keys | null = null;
 
 function systemName(): string {
@@ -92,11 +127,13 @@ function showProblem(message: string, error?: unknown): void {
   ].join('\n');
 }
 
-// Each stage glides the bar on the compositor, so it moves while the build blocks this thread.
+// Each stage glides the bar on the compositor, so it moves while the build blocks this thread (the painting's steps
+// were all timed when the load began; the last stage brings in any still to come).
 function say(message: string, to: number, ms: number): Promise<void> {
   if (problems.length) return Promise.reject(STOPPED);
   facts.stage = message;
   status.textContent = message;
+  if (to >= 1) reveal.last();
   const animation = bar.animate(
     [{ transform: `scaleX(${loaded})` }, { transform: `scaleX(${to})` }],
     {
@@ -115,6 +152,17 @@ function say(message: string, to: number, ms: number): Promise<void> {
 
 async function start(): Promise<void> {
   booted = true;
+  // the sheet first (at most FIRST_PAINT_MS), its logo shown and painted once, then the load; the wait is the
+  // performance measure 'loader wait'
+  performance.mark('loader wait');
+  await Promise.race([
+    sheetDecoded,
+    new Promise((done) => setTimeout(done, FIRST_PAINT_MS)),
+  ]);
+  showLogo();
+  await new Promise((done) => requestAnimationFrame(() => setTimeout(done)));
+  performance.measure('loader wait', 'loader wait');
+  reveal.begin();
   try {
     // the level first (it asks the GPU adapter): every module of the scene is built for it
     await chooseLevel();
@@ -150,7 +198,9 @@ async function start(): Promise<void> {
   document.body.dataset.state = 'settling';
   if (tik.visible()) scene.resume();
   setTimeout(() => {
-    if (!problems.length) document.body.dataset.state = 'ready';
+    if (problems.length) return;
+    document.body.dataset.state = 'ready';
+    reveal.done();
   }, SETTLE_MS);
 }
 
@@ -199,9 +249,32 @@ function toggleStats(): boolean {
   return statsOn;
 }
 
-// the hint goes after the first steps, by the button or by a key
+// the hint goes after the first steps, by the corner or by a key; from then on the walker's way from there is watched
 function markWalked(): void {
   document.body.classList.add('walked');
+  if (!walkFrom && scene) {
+    walkFrom = scene.walker();
+    watchLeaving();
+  }
+}
+
+// Once the walker is LEAVE_M (straight line) from where the walk began, the start area is learnt: the ring fades
+// away for good (.left; the corner still walks). Checked twice a second while the tik is on screen
+function watchLeaving(): void {
+  if (leaveTimer || !walkFrom || document.body.classList.contains('left'))
+    return;
+  leaveTimer = window.setInterval(() => {
+    if (!scene || !walkFrom) return;
+    const [x, z] = scene.walker();
+    if (Math.hypot(x - walkFrom[0], z - walkFrom[1]) <= LEAVE_M) return;
+    document.body.classList.add('left');
+    stopWatching();
+  }, LEAVE_CHECK_MS);
+}
+
+function stopWatching(): void {
+  clearInterval(leaveTimer);
+  leaveTimer = 0;
 }
 
 const controls = attachControls(
@@ -218,6 +291,7 @@ function onVisible(): void {
   if (!booted) void start();
   else scene?.resume();
   startStats();
+  watchLeaving();
 }
 
 function onHidden(): void {
@@ -225,6 +299,27 @@ function onHidden(): void {
   keys?.release();
   scene?.pause();
   stopStats();
+  stopWatching();
+}
+
+// Dev only: ?loader=0.6 (or localStorage.forestLoader) holds the loading screen at that point, nothing loaded
+function heldLoader(): number | null {
+  if (!ON_DEV_MACHINE) return null;
+  let held = new URLSearchParams(location.search).get('loader');
+  try {
+    held ??= localStorage.getItem('forestLoader');
+  } catch {
+    // storage is blocked: only the address can hold it
+  }
+  const at = Number(held);
+  return held !== null && at >= 0 && at <= 1 ? at : null;
+}
+const held = heldLoader();
+if (held !== null) {
+  booted = true; // (the load never starts)
+  reveal.show(held);
+  bar.style.transform = `scaleX(${held})`;
+  status.textContent = `Held at ${Math.round(held * 100)}%`;
 }
 
 if (tik.visible()) onVisible();

@@ -565,32 +565,10 @@ function* bakeWind(rnd) {
 }
 
 // ---------------------------------------------------------------- thunder
-// Thunder (11-sound-refs.md 3): crack, the near flash's tearing at the start (noise 0.45 to 3.6 kHz, sudden, four
-// claps over most of a second, each dying long before the buffer ends); rumble, a 10 s loop of low roll (brown
-// noise from 30 Hz) whose bursts sway it a few dB only: the strike's shape is thunderShape's, drawn anew each time
-// and laid over it live (audio.js), as is what the distance takes off its top
+// Thunder (11-sound-refs.md 3): rumble, a 10 s loop of low roll (brown noise from 30 Hz) whose bursts sway it a few
+// dB only: the strike's shape is thunderShape's, drawn anew each time and laid over it live (audio.js), as is its
+// level by the distance
 function* bakeThunder(rnd) {
-  const crack = alloc(floor(1.9 * LOW_SR), LOW_SR);
-  {
-    const x = crack,
-      sr = LOW_SR;
-    for (let k = 0, t = 0.002; k < 4; k++, t += 0.12 + 0.18 * rnd()) {
-      const i0 = floor(t * sr),
-        rise = 0.002 * sr,
-        fall = exp(-1 / (0.11 * sr));
-      for (let i = i0, e = pow(0.8, k); i < x.length; i++) {
-        x[i] += (rnd() * 2 - 1) * e * min((i - i0) / rise, 1);
-        e *= fall;
-        if (!(i & 4095)) yield;
-      }
-    }
-    yield* passes(
-      x,
-      biquad('hp', 435, 0.7, 0, sr),
-      biquad('lp', 3630, 0.7, 0, sr),
-    );
-    yield* norm(x, 0.9);
-  }
   const rumble = yield* bed(10, DEEP_SR, function* (x, sr) {
     const env = new Float32Array(x.length);
     let b = 0;
@@ -625,17 +603,16 @@ function* bakeThunder(rnd) {
     for (let i = 0; i < x.length; i++) x[i] *= 0.7 + env[i];
     yield* norm(x, 0.9);
   });
-  return { crack, rumble };
+  return { rumble };
 }
 export const SHAPE_RATE = 50; // thunderShape's points a second
-// A strike's shape, as gains at SHAPE_RATE from the moment it is heard: `far` 0 (a kilometre) to 1 (six or more).
-// Near: up in a fifth of a second, then falling with a swell or two on the way, at -20 dB 2.4 to 2.8 s after its
-// peak; far: swelling in from nothing over 2.5 to 4 s, at -20 dB some 5 s after. Then a tail that falls on, a fainter
-// swell or two in it, to -90 dB, and silence: it never stops loud
-export function thunderShape(far, rnd) {
-  const rise = 0.2 + far * (2.3 + 1.5 * rnd()),
-    t20 = 2.45 + 0.3 * rnd() + far * (2.1 + 0.8 * rnd()),
-    tail = 7 + 3 * far,
+// A strike's shape, as gains at SHAPE_RATE from the moment it is heard, the same at every distance (a far roll):
+// swelling in from nothing over 2 to 3.2 s, then falling with a swell or two on the way, at -20 dB 4.1 to 5 s after
+// its peak; then a tail that falls on, a fainter swell or two in it, to -90 dB, and silence: it never stops loud
+export function thunderShape(rnd) {
+  const rise = 0.2 + 0.8 * (2.3 + 1.5 * rnd()),
+    t20 = 2.45 + 0.3 * rnd() + 0.8 * (2.1 + 0.8 * rnd()),
+    tail = 9.4,
     swell = (t, at, len, db) =>
       db * max(0, sin((PI * (t - at)) / len)) * (t > at && t < at + len),
     swells = (n, from, to, db) =>
@@ -649,7 +626,7 @@ export function thunderShape(far, rnd) {
       }),
     early = swells(1 + floor(rnd() * 2), 0.4, t20 - 0.3, 7),
     late = swells(1 + floor(rnd() * 2), t20 + 0.5, t20 + 5, 4),
-    // the swell's own bumps on the way up (far: it comes in waves)
+    // the swell's own bumps on the way up (it comes in waves)
     up = swells(2, 0, rise, 6),
     n = floor((rise + t20 + tail) * SHAPE_RATE) + 2,
     out = new Float32Array(n);

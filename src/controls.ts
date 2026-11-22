@@ -1,5 +1,5 @@
-// Touch controls: the corner button walks while held, a drag anywhere else turns the view.
-// Each gets its own finger, so one thumb can walk while the other steers.
+// Touch controls: the bottom left corner (#walk, a --walk-zone square in index.html) walks while held, shown or
+// not; a drag anywhere else turns the view. Each gets its own finger, so one thumb can walk while the other steers.
 import type { SceneInput } from './scene/scene.js';
 
 // A hidden tuning gesture: SECRET_TAPS taps within SECRET_MS in the top right SECRET_PX square.

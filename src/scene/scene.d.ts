@@ -35,6 +35,8 @@ export interface Scene {
   wake(): void;
   /** One line of numbers since the last call: frame rate, worst frame, render size, draw distance, level. */
   stats(): string;
+  /** Where the walker stands: x and z, in metres. */
+  walker(): number[];
   /** For looking around from a debugger: jump to a viewpoint (0-5) or to any place and target, hold a state of the weather. */
   debug: {
     view(index: number): void;

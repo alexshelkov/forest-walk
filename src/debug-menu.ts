@@ -24,16 +24,19 @@ const MAKES = [
   'stepping stones',
 ];
 const BEFORE = 2; // a crossing is looked along from this many metres before its near end
-const SOUND_KEY = 'forestSound'; // each sound type's [on, dB offset], kept by the menu
+// each sound type's [on, dB offset], kept by the menu (a new key: the offsets kept under the old one are now the
+// types' own levels, audio.js TYPE_DB)
+const SOUND_KEY = 'forestSoundOffsets';
 
-// (#stats makes room for the button; plain insets: a tik's safe area is outside its frame)
+// (the open button is only its glyph, as faint as the host's own pause mark; #stats makes room for it; plain insets:
+// a tik's safe area is outside its frame)
 const CSS = `
 #debug { position: fixed; top: 10px; right: 10px; z-index: 5; display: flex; flex-direction: column;
   align-items: flex-end; gap: 6px; max-height: calc(100% - 20px); pointer-events: none; }
 #debug > * { pointer-events: auto; }
 #debug button { border: 0; color: inherit; font: inherit; touch-action: manipulation; }
-#debug .open { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%;
-  background: #120a0599; box-shadow: 0 0 0 1px #ffe9bf40; }
+#debug .open { display: grid; place-items: center; width: 44px; height: 44px; background: none;
+  color: #ffffff94; filter: drop-shadow(0 0 3px #120a0540); }
 #debug .panel { display: none; width: 216px; padding: 10px; overflow: auto; border-radius: 12px;
   background: #120a05e6; box-shadow: 0 0 0 1px #ffe9bf40; font: 600 12px/1.3 system-ui, sans-serif; }
 #debug.is-open .panel { display: block; }
@@ -69,7 +72,7 @@ export function attachDebugMenu(
   open.className = 'open';
   open.setAttribute('aria-label', 'Debug menu');
   open.innerHTML =
-    '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>';
+    '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.7" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>';
   const panel = document.createElement('div');
   panel.className = 'panel';
   root.append(open, panel);
