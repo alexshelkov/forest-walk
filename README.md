@@ -1,5 +1,20 @@
 # Forest walk
 
+<table>
+  <tr>
+    <td><img src="screenshots/1.webp" width="200" alt="Light through the trees at the footbridge"></td>
+    <td><img src="screenshots/2.webp" width="200" alt="A forest path in the morning sun"></td>
+    <td><img src="screenshots/3.webp" width="200" alt="The creek's falls under a maple"></td>
+    <td><img src="screenshots/4.webp" width="200" alt="A path in the rain"></td>
+  </tr>
+  <tr>
+    <td align="center">Footbridge</td>
+    <td align="center">Morning sun</td>
+    <td align="center">The falls</td>
+    <td align="center">Rain</td>
+  </tr>
+</table>
+
 A [tik](https://codetik.dev): a small interactive app that runs inside a phone,
 offline, in the Codetik feed.
 
